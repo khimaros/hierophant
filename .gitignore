@@ -1,0 +1,10 @@
+/build/
+/build-vulkan/
+/models/
+/runs/
+/lora/
+# prompt sets are fetched by `make datasets`; only the manifest pinning them is kept
+/data/*
+!/data/manifest.json
+__pycache__/
+*.part

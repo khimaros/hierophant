@@ -1,0 +1,5 @@
+[tools]
+cmake = "3.31.12"
+ninja = "1.13.2"
+python = "3.14"
+ruff = "0.16.10"

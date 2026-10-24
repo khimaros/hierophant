@@ -1,0 +1,65 @@
+# llama.cpp's style, trimmed to the keys that matter for plain c++17
+---
+Language:        Cpp
+AlignAfterOpenBracket: Align
+AlignArrayOfStructures: Left
+AlignConsecutiveAssignments: AcrossComments
+AlignConsecutiveBitFields: AcrossComments
+AlignConsecutiveDeclarations: AcrossComments
+AlignConsecutiveMacros: AcrossComments
+AlignEscapedNewlines: Left
+AlignOperands:   Align
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 1
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: Inline
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakBeforeMultilineStrings: true
+BinPackArguments: true
+BinPackParameters: false
+BreakBeforeBraces: Attach
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: false
+BreakConstructorInitializers: AfterColon
+ColumnLimit:     120
+ContinuationIndentWidth: 4
+Cpp11BracedListStyle: false
+DerivePointerAlignment: false
+EmptyLineAfterAccessModifier: Never
+FixNamespaceComments: true
+IncludeBlocks:   Regroup
+IncludeCategories:
+  - Regex:           '".*"'
+    Priority:        1
+  - Regex:           '^<.*\.h>'
+    Priority:        2
+  - Regex:           '^<.*'
+    Priority:        3
+IndentCaseBlocks: true
+IndentCaseLabels: true
+IndentPPDirectives: AfterHash
+IndentWidth:     4
+InsertBraces:    true
+InsertNewlineAtEOF: true
+KeepEmptyLinesAtTheStartOfBlocks: false
+LambdaBodyIndentation: Signature
+MaxEmptyLinesToKeep: 1
+NamespaceIndentation: None
+PointerAlignment: Middle
+QualifierAlignment: Left
+ReferenceAlignment: Middle
+ReflowComments:  false
+SeparateDefinitionBlocks: Always
+SortIncludes:    CaseInsensitive
+SpaceAfterCStyleCast: true
+SpaceBeforeParens: ControlStatements
+SpacesBeforeTrailingComments: 1
+Standard:        c++17
+UseTab:          Never
+...

@@ -1,0 +1,67 @@
+{
+  "harmful-train": {
+    "dataset": "mlabonne/harmful_behaviors",
+    "revision": "01cead01398926d81f7c52bdb790ee8cf77ebba7",
+    "config": "default",
+    "split": "train",
+    "column": "text",
+    "n": 416,
+    "sha256": "c9073b1ef658801f97430a0d3e5add76eb4590c5691e7465383d933def99e545"
+  },
+  "harmless-train": {
+    "dataset": "mlabonne/harmless_alpaca",
+    "revision": "02c6a92cfcf11bb0c387334f8146d149d65b587f",
+    "config": "default",
+    "split": "train",
+    "column": "text",
+    "n": 416,
+    "sha256": "afb4fd939b5fa71a6ed6fa03b3593289a82b2ecd97812b3b763cccdddf7e6748"
+  },
+  "harmful-test": {
+    "dataset": "mlabonne/harmful_behaviors",
+    "revision": "01cead01398926d81f7c52bdb790ee8cf77ebba7",
+    "config": "default",
+    "split": "test",
+    "column": "text",
+    "n": 100,
+    "sha256": "1e1ee6d98c7eeab686f44403f13f44ae8e52f3ff289ef4210573a9051afb10fc"
+  },
+  "harmless-test": {
+    "dataset": "mlabonne/harmless_alpaca",
+    "revision": "02c6a92cfcf11bb0c387334f8146d149d65b587f",
+    "config": "default",
+    "split": "test",
+    "column": "text",
+    "n": 100,
+    "sha256": "6d94b3a46cb0d4d62c31c895c9ca3c6d1c57e505d06f792ad6cc4ab6c021dfd5"
+  },
+  "wikitext-test": {
+    "dataset": "Salesforce/wikitext",
+    "revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+    "config": "wikitext-2-raw-v1",
+    "split": "test",
+    "column": "text",
+    "n": 600,
+    "sha256": "d050c708de873f4a9fc572ba5f9bbe5d6f7bb02d7316457610bf4e10798fafb6"
+  },
+  "harmful-jbb": {
+    "dataset": "JailbreakBench/JBB-Behaviors",
+    "revision": "886acc352a31533ffbcf4ef22c744658688086fc",
+    "config": "behaviors",
+    "split": "harmful",
+    "column": "Goal",
+    "n": 89,
+    "sha256": "a3d33f4b634e36c240ffdfc69721e3a4cd2b91dbd7e42a2614360cd95da38c93",
+    "excluded": 11
+  },
+  "harmful-lat": {
+    "dataset": "LLM-LAT/harmful-dataset",
+    "revision": "8bfba31bc6d93a5b71808fee5275ef4b6330ed91",
+    "config": "default",
+    "split": "train",
+    "column": "prompt",
+    "n": 613,
+    "sha256": "ad79173bcb1f068e5882d9955ed55f41e2e0720977fd83504c51740a56e0b14f",
+    "excluded": 387
+  }
+}
