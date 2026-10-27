@@ -379,7 +379,8 @@ class PooledSets(unittest.TestCase):
         p = subprocess.run(cmd, capture_output=True, text=True, check=False)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         replies = json.loads((d / "results.json").read_text())["a.gguf"][0]["replies"]
-        self.assertEqual([r["prompt"] for r in replies], ["first", "second", "third"])
+        # alternated, so any slice of the pool is a mix of its sets
+        self.assertEqual([r["prompt"] for r in replies], ["first", "third", "second"])
         self.assertFalse((d / "a.json").exists())
 
 
@@ -451,6 +452,9 @@ class JudgeAndSequenceKld(unittest.TestCase):
                      f"kl base logits [{full}] 2/2 100%", f"r2.gguf scale 1 kl [{full}] 2/2 100%"):
             self.assertIn(line, self.proc.stderr)
         self.assertIn("\r", self.proc.stderr)
+        # the whole sweep (the base, one scale, its kl) prefixes each bar and ends on a line of its own
+        self.assertRegex(self.proc.stderr, r"sweep \d/3 [\d:]+ \| r2\.gguf scale 1 verdicts \[")
+        self.assertIn(f"sweep [{full}] 3/3 100%", self.proc.stderr)
         self.assertNotIn("base replies: ", self.proc.stdout)
 
 

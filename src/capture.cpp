@@ -89,13 +89,13 @@ static bool on_eval(ggml_tensor * t, bool ask, void * user_data) {
 }
 
 // one prompt per line; "\n" and "\\" are the only escapes.
-static void read_prompts(const std::string & path, int limit, std::vector<std::string> & out) {
+static void read_prompts(const std::string & path, std::vector<std::string> & out) {
     std::ifstream f(path);
     if (!f) {
         fatal("failed to open '%s'", path.c_str());
     }
     std::string line;
-    while (std::getline(f, line) && (limit <= 0 || (int) out.size() < limit)) {
+    while (std::getline(f, line)) {
         if (line.empty()) {
             continue;
         }
@@ -112,11 +112,22 @@ static void read_prompts(const std::string & path, int limit, std::vector<std::s
     }
 }
 
-// the prompts of a comma-separated list of files, pooled, at most limit in all.
+// the prompts of a comma-separated list of files, at most limit in all, pooled as the
+// scripts' load_prompts does: each file's next prompt in turn, so a limit mixes the sets.
 static std::vector<std::string> load_prompts(const std::string & paths, int limit) {
-    std::vector<std::string> out;
+    std::vector<std::vector<std::string>> sets;
+    size_t                                longest = 0;
     for (const auto & path : split(paths, ',')) {
-        read_prompts(path, limit, out);
+        read_prompts(path, sets.emplace_back());
+        longest = std::max(longest, sets.back().size());
+    }
+    std::vector<std::string> out;
+    for (size_t i = 0; i < longest; i++) {
+        for (const auto & s : sets) {
+            if (i < s.size() && (limit <= 0 || (int) out.size() < limit)) {
+                out.push_back(s[i]);
+            }
+        }
     }
     if (out.empty()) {
         fatal("no prompts in '%s'", paths.c_str());

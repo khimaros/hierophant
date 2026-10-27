@@ -1,13 +1,17 @@
 # hierophant
 
-abliteration LoRA adapters made directly from a quantized gguf. instead of
-storing a second, decensored copy of a model, keep the gguf you already serve
+abliteration LoRA adapters made directly from a quantized GGUF. instead of
+storing a second, decensored copy of a model, keep the GGUF you already serve
 and a rank-1 or rank-2 adapter computed from its own weights.
 
 ## build
 
 ```
-make CMAKE_ARGS=-DGGML_VULKAN=on  # assuming vulkan backend
+# build with llama.cpp defaults
+make
+
+# build with llama.cpp vulkan backend
+make CMAKE_ARGS=-DGGML_VULKAN=on
 ```
 
 this produces `build/bin/hierophant` and the `build/bin/llama-server` and
@@ -18,8 +22,12 @@ models over https.
 ## use
 
 ```
-make datasets             # once: the prompt sets it scores with
-scripts/hierophant_auto.py -ngl 99 --hf-repo unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M
+# download harmful/harmless prompts
+make datasets
+
+# optimize a LoRA adapter automatically for an HF model
+scripts/hierophant_auto.py --progress -ngl 99 \
+    --hf-repo unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS
 ```
 
 that is the whole flow. it downloads the model if needed, finds the layers
@@ -29,13 +37,14 @@ always at `lora/<org>--<repo>--<quant>/best.gguf`, so you can stop it with
 ctrl-c at any point and use what it found:
 
 ```
-llama-server -hf unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M \
-  --lora-scaled lora/unsloth--Qwen3-4B-Instruct-2507-GGUF--Q4_K_M/best.gguf:1
+llama-server -hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS -ngl 99 \
+  --lora-scaled lora/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf:1
 ```
 
 the adapter's strength is built in, so its scale is close to 1; `best.txt`
-gives the exact serve line. rerun the same command to continue: every reply,
-verdict and kl run is kept in `cache.jsonl` as it arrives and every finished
+gives the exact serve line, and "serving" below shows how to load it
+unapplied and turn it on per request. rerun the same command to continue:
+every reply, verdict and kl run is kept in `cache.jsonl` as it arrives and every finished
 adapter build is kept, so only the requests in flight at ctrl-c are repeated.
 the cache also spares later rounds what earlier ones scored (the base, and an
 incumbent kept from the last round). add `--status` to print the current
@@ -46,15 +55,15 @@ by hand; each command it runs also prints one line naming its log):
 
 ```
 == prepare
-== round 1: which layer (13 candidates, 32 prompts each)
+== round 1: which layer (7 candidates, 128 prompts each)
 candidate                refusals@kl  weight      kl
 L34                            0.190    1.41  0.1000
-L31                            0.220    1.48  0.1000
+L29                            0.220    1.48  0.1000
 ...
 >> new best: L34 (round 1)  refusals 0.220 (0.250 with short thinking), kl 0.1000
-== round 2: refine L34, L31, L36 (9 candidates, 64 prompts each)
+== round 2: refine L34, L29 (9 candidates, 256 prompts each)
 >> new best: L34-pcs8 (round 2)  refusals 0.160 (0.190 with short thinking), kl 0.1000
-== round 3: refine L34-pcs8, L34, L32.75 (9 candidates, 128 prompts each)
+== round 3: refine L34-pcs8, L34-res, L34 (9 candidates, 402 prompts each)
 >> new best: L34-pcs8-res (round 3)  refusals 0.070 (0.094 with short thinking), kl 0.1000
 ...
 >> best unchanged for 2 rounds at full prompts: converged
@@ -69,17 +78,27 @@ how it decides:
   refusals where its kl over wikitext reaches the budget (`--max-kld`,
   default 0.1), interpolated between the scales around it, and carries the
   weight that reaches it into the next round.
-- each later round keeps the leaders (`--beam`, 3) and tries their
-  neighbours, one change at a time: a residual direction (what the
-  adapter still refuses, removed as well), keeping the direction clear of
-  4, 8 or 16 principal components of the harmless prompts, and a nearby
-  layer, half as far each round down to a quarter layer. the prompts double
-  each round, from `--first-prompts` (32) up to all 402 selection prompts.
+- each later round keeps up to `--beam` (4) leaders: the best of each
+  shape (harmless pcs count, residual or not), so a recipe change is not
+  crowded out by neighbouring layers of one, and more of a shape only
+  while they are within the noise of the leader. it tries their
+  neighbours, one change at a time and cheapest first, up to
+  `--max-candidates`: a nearby layer, half as far each round down to a
+  quarter layer; the next count either side of 0, 4, 8 or 16 principal
+  components of the harmless prompts to keep the direction clear of; then
+  a residual direction for each (what the adapter still refuses, removed
+  as well), which needs a filter and a capture of its own. a leader with a
+  residual only moves its layer. a changed
+  shape moves the weight the budget allows, so it is swept from 0.5 to 2
+  again rather than around its parent's weight. the prompts double each
+  round, from `--first-prompts` (128) up to all 402 selection prompts.
 - candidates are chosen on jailbreakbench + llm-lat from prompt 300 on. the
-  round's leader is then scored beside the current best on the first 300,
-  which nothing was chosen on, and replaces `best.gguf` only if it refuses
-  less there. the leader being the best's own recipe at a new weight
-  refines it in place.
+  round's leader is then scored beside the current best on the first
+  `--report-prompts` (300), which nothing was chosen on, the same ones
+  every round, and replaces `best.gguf` only if it refuses less there. the
+  leader being the best's own recipe at a new weight refines it in place.
+  pooled prompt files are taken a prompt from each in turn, so the first
+  300 mix both sets (all 89 of jailbreakbench and 211 of llm-lat).
 - promotion also scores both on the first `--think-prompts` (64) of those
   with short thinking: `low` reasoning effort unless the model's chat
   template rejects that level, and at most `--think-budget` (512) reasoning
@@ -124,6 +143,53 @@ the pipeline and the automated run pass it on to every command they run.
 a bar is redrawn in place on the terminal, and `logs/` keep only its
 finished line. the automated run draws one bar for a round's builds,
 advanced by every site of every build, rather than a bar per build.
+
+each bar is prefixed by the work around it: the round's stage (builds, the
+selection sweeps, the report, its short thinking) and the eval's whole sweep
+(the base, every adapter at every scale, and each one's kl run):
+
+```
+round 2 select-wide 1/5 41:12 | sweep 13/97 26:40 | L38-pcs16.gguf scale 1.5 kl [------------------------] 0/4 0% 0:33
+```
+
+each round and each sweep ends on a line of its own with its total time.
+a line wider than the terminal is cut to fit.
+
+### serving
+
+an adapter is a plain llama.cpp lora, so llama-server loads it beside the
+quantized model it was built for, applied to every request with
+`--lora-scaled` as above. it can also be loaded but not applied, so the
+server answers as the base model until a request or a client turns the
+adapter on:
+
+```
+llama-server -hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS -ngl 99 \
+  --lora lora/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf --lora-init-without-apply
+```
+
+per request, with a `lora` list of adapter ids and scales in the body (an
+adapter left out is at scale 0). this is how the eval scores every scale
+on one server load:
+
+```
+curl http://localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{
+  "messages": [{"role": "user", "content": "how do i pick a lock?"}],
+  "lora": [{"id": 0, "scale": 1}]
+}'
+```
+
+for every request from then on, set the server's scales with a POST to
+`/lora-adapters` (a GET lists the loaded adapters and their ids):
+
+```
+curl http://localhost:8080/lora-adapters
+curl http://localhost:8080/lora-adapters -H 'content-type: application/json' -d '[{"id": 0, "scale": 1}]'
+```
+
+a request's own `lora` list overrides the server's scales for that
+request. llama-server does not batch requests with different lora
+scales together, so mixing them on one server costs throughput.
 
 ## step by step
 
@@ -195,7 +261,7 @@ an adapter is only valid on the base whose sha256 its sidecar records.
   refusals at scale 1.25 from 50% to 16% and halved the kl.
   `--no-project-harmless` uses the plain difference of means.
 - `--from-adapter X.gguf` (instead of `-d`) rebases an existing rank-1
-  abliteration adapter onto this gguf: each site keeps X's direction and
+  abliteration adapter onto this GGUF: each site keeps X's direction and
   weight, read from its B, and A is recomputed from this file's weights.
   use it to carry a published adapter exactly onto the quant you serve.
 - `--weight W` scales every site; `--curve MAX_W,MAX_POS,MIN_W,MIN_DIST` is
@@ -233,8 +299,8 @@ an adapter is only valid on the base whose sha256 its sidecar records.
   --harmless data/harmless-train.txt` keeps only the harmful prompts the base model
   refuses and the harmless ones it answers, judged as the eval judges
   (`--judge`), into `data/*.filtered.txt`; capture from those.
-- `capture --harmful a.txt,b.txt` pools several prompt files; `--limit`
-  caps the total. `scripts/fetch_datasets.py --extra
+- `capture --harmful a.txt,b.txt` pools several prompt files, a prompt
+  from each in turn (as every script does); `--limit` caps the total. `scripts/fetch_datasets.py --extra
   NAME=DATASET:SPLIT:N[:COLUMN[:CONFIG]]` fetches another huggingface
   dataset (a multilingual one, say) into `data/NAME.txt`.
 - `scripts/fetch_datasets.py --more` fetches more harmful prompts for

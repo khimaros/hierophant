@@ -14,6 +14,7 @@ unfinished round from its finished builds and every request already answered.
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -37,20 +38,21 @@ from hierophant_pipeline import (
     step_capture,
     step_filter,
 )
-from progress import Bar
+from progress import Bar, Quiet, outer
 
 SELECT_OFFSET = 300  # candidates are chosen on jbb+lat from here; the first 300 report the best
-REPORT_MAX = 300
-FIRST_PROMPTS = 32  # doubled every round, up to all of the selection prompts
-GRID = (0.3, 0.9, 0.05)  # round 1 indices: from, to and step as fractions of the depth
-WIDE_SCALES = "0.5,0.75,1,1.25,1.5,2"  # round 1, before any weight is known
-NARROW_SCALES = "0.85,1,1.15"  # later rounds, around the weight each candidate carries
+REPORT_PROMPTS = 300  # every promotion is decided on the same held-out prompts
+# doubled every round, up to all of the selection prompts. fewer make round 1's ranking
+# noise: at 10% refusals, 32 prompts carry +-0.05, more than candidates differ by
+FIRST_PROMPTS = 128
+GRID = (0.3, 0.9, 0.1)  # round 1 indices: from, to and step as fractions of the depth
+WIDE_SCALES = "0.5,0.75,1,1.25,1.5,2"  # before a candidate's weight is known
+NARROW_SCALES = "0.85,1,1.15"  # around the weight a candidate carries
 PCS = (0, 4, 8, 16)  # harmless principal components a direction may be kept orthogonal to
-BEAM = 3
+BEAM = 4
 MAX_CANDIDATES = 9
 MIN_STEP = 0.25  # finest index step, in layers
 RESIDUAL_FROM = 2  # first round that may add a residual direction
-RESIDUAL_LEADERS = 2  # beam members that may get one
 RESIDUAL_REUSE = 0.1  # a residual captured within this relative weight of a candidate's is reused
 MIN_SCALE = 0.05  # below this the budget allows no edit; the weight is left as it was
 PATIENCE = 2  # rounds at full prompts without a new best before stopping
@@ -91,20 +93,43 @@ def grid(n_layer):
     return sorted({min(max(round(n_layer * f), 1), n_layer - 1) for f in fractions}), n_layer * step
 
 
-def proposals(beam, step, n_layer, residual_for):
-    """each beam member's neighbours, varying one thing, in the order they paid off on
-    qwen3.8 for when the candidates are capped: a residual (for the first residual_for),
-    the next harmless pcs counts, then the index by +-step (to a quarter layer)."""
-    out = []
-    for i, c in enumerate(beam):
-        if i < residual_for and not c["residual"]:
-            out.append({**c, "residual": True})
-        k = PCS.index(c["pcs"])
-        out += [{**c, "pcs": p} for p in PCS[max(k - 1, 0):k + 2] if p != c["pcs"]]
-        for d in (-step, step):
-            index = round((c["index"] + d) * 4) / 4
-            if 1 <= index <= n_layer - 1 and index != c["index"]:
-                out.append({**c, "index": index})
+def proposals(beam, step, n_layer, residual):
+    """the beam members' neighbours, each varying one thing, cheapest first for when the
+    candidates are capped: the index by +-step (to a quarter layer), the next harmless pcs
+    count either side, then those needing a capture of their own: a residual (with
+    residual) and a residual member's index. a residual member changes nothing else, and
+    a pcs count that wins joins the beam, so further counts are reached a step at a time.
+    a changed shape moves where the kl budget is reached, so it is swept wide rather than
+    around the weight it inherits."""
+    plain, resid = [c for c in beam if not c["residual"]], [c for c in beam if c["residual"]]
+
+    def indices(members):
+        return [{**c, "index": i} for c in members
+                for i in (round((c["index"] + d) * 4) / 4 for d in (-step, step))
+                if 1 <= i <= n_layer - 1 and i != c["index"]]
+
+    pcs = [{**c, "pcs": PCS[j], "wide": True} for c in plain
+           for j in (PCS.index(c["pcs"]) - 1, PCS.index(c["pcs"]) + 1) if 0 <= j < len(PCS)]
+    residuals = [{**c, "residual": True, "wide": True} for c in plain if residual]
+    return indices(plain) + pcs + residuals + indices(resid)
+
+
+def shape(c):
+    return c["pcs"], c["residual"]
+
+
+def select_beam(ranked, n, size):
+    """the leaders the next round refines, in rank order: each shape's best, so a recipe
+    change is not crowded out by neighbouring indices of one, and others of a shape only
+    while within the noise of the leader (the standard error of a difference on n prompts)."""
+    lead = ranked[0]["refusals"]
+    p = max(lead, 1 / n)
+    noise = math.sqrt(2 * p * (1 - p) / n)
+    out, shapes = [], set()
+    for x in ranked:
+        if len(out) < size and (shape(x["cand"]) not in shapes or x["refusals"] <= lead + noise):
+            out.append(x["cand"])
+            shapes.add(shape(x["cand"]))
     return out
 
 
@@ -131,17 +156,16 @@ def unchanged_after(unchanged, outcome, n, pool):
 
 def first_state(a, n_layer):
     indices, step = ([float(i) for i in a.indices.split(",")], 1.0) if a.indices else grid(n_layer)
-    return {"round": 0, "step": step, "candidates": [{"index": i, "pcs": 0, "residual": False, "weight": 1.0}
-                                                     for i in indices],
+    return {"round": 0, "step": step, "candidates": [{"index": i, "pcs": 0, "residual": False, "weight": 1.0,
+                                                      "wide": True} for i in indices],
             "beam": [], "seen": [], "best": None, "unchanged": 0}
 
 
 def next_candidates(st, n_layer, a, rnd):
     """the beam, then its untried neighbours, up to --max-candidates."""
     step = max(st["step"] / 2, MIN_STEP)
-    residual_for = RESIDUAL_LEADERS if rnd >= RESIDUAL_FROM else 0
     out, names = list(st["beam"]), {key(c) for c in st["beam"]}
-    for c in proposals(st["beam"], step, n_layer, residual_for):
+    for c in proposals(st["beam"], step, n_layer, residual=rnd >= RESIDUAL_FROM):
         if len(out) >= a.max_candidates:
             break
         if key(c) not in names and key(c) not in st["seen"]:
@@ -155,6 +179,7 @@ class Auto(Run):
 
     echo = False
     rollup = ("sites",)  # each build's sites advance the round's builds bar
+    round_bar = Quiet()  # the round's stage, before every bar drawn in it
 
     def build(self, d, cands):
         """one adapter per candidate in d, each named after it; those differing only in
@@ -247,13 +272,15 @@ class Auto(Run):
         cands, step = (st["candidates"], st["step"]) if rnd == 1 else next_candidates(st, n_layer, self.a, rnd)
         what = "which layer" if rnd == 1 else f"refine {', '.join(key(c) for c in st['beam'])}"
         print(f"== round {rnd}: {what} ({len(cands)} candidates, {n} prompts each)", flush=True)
-        cands = self.build(d, cands)
-        sweeps = self.score(d.name, [d / f"{key(c)}.gguf" for c in cands], n, SELECT_OFFSET,
-                            WIDE_SCALES if rnd == 1 else NARROW_SCALES, SELECT_CHUNKS, d / "select.json")
-        ranked = rank(cands, sweeps, self.a.max_kld)
-        print_ranked(ranked)
-        best, outcome = self.report(d, ranked[0], st["best"], min(n, REPORT_MAX), rnd)
-        new = {"round": rnd, "n": n, "step": step, "candidates": [], "beam": [x["cand"] for x in ranked[:self.a.beam]],
+        # builds, a selection per sweep width, the report and its short thinking
+        stages = 3 + len({c.get("wide", False) for c in cands})
+        with outer(self.progress, f"round {rnd}", stages, sys.stdout) as self.round_bar:
+            self.round_bar.stage("builds")
+            cands = self.build(d, cands)
+            ranked = rank(cands, self.select(d, cands, n), self.a.max_kld)
+            print_ranked(ranked)
+            best, outcome = self.report(d, ranked[0], st["best"], min(self.a.report_prompts, SELECT_OFFSET), rnd)
+        new = {"round": rnd, "n": n, "step": step, "candidates": [], "beam": select_beam(ranked, n, self.a.beam),
                "seen": sorted({*st["seen"], *(key(c) for c in cands)}), "best": best,
                "unchanged": unchanged_after(st["unchanged"], outcome, n, pool)}
         (d / "round.json").write_text(json.dumps({"n": n, "candidates": ranked, "outcome": outcome, "best": best},
@@ -261,11 +288,24 @@ class Auto(Run):
         self.finish(new, outcome)
         return new
 
+    def select(self, d, cands, n):
+        """{adapter file name: sweep} on n selection prompts, swept wide where a candidate's
+        weight is not known yet and narrow around it where it is."""
+        sweeps = {}
+        for wide, suffix, scales in ((True, "-wide", WIDE_SCALES), (False, "", NARROW_SCALES)):
+            group = [d / f"{key(c)}.gguf" for c in cands if c.get("wide", False) == wide]
+            if group:
+                self.round_bar.stage(f"select{suffix}")
+                sweeps |= self.score(f"{d.name}{suffix}", group, n, SELECT_OFFSET, scales, SELECT_CHUNKS,
+                                     d / f"select{suffix}.json")
+        return sweeps
+
     def report(self, d, leader, best, n, rnd):
         """the leader, rebuilt at the weight that reaches the budget, beside the current best
         on n held-out prompts, thinking off and with short thinking. returns the best from now
         on and the outcome: "new" when a different recipe takes over, "refined" when the best's
         own recipe is rebuilt at its new weight, "kept" when the best stays as it was."""
+        self.round_bar.stage("report")
         rd = d / "report"
         rd.mkdir(exist_ok=True)
         mine = self.build(rd, [leader["cand"]])
@@ -299,6 +339,7 @@ class Auto(Run):
         kept short, which is not how the model is served; the final check covers that."""
         if not n:
             return {}
+        self.round_bar.stage("think")
         a = self.a
         capped = a.think_budget >= 0
         budget = ["--reasoning-budget", a.think_budget, "--reasoning-budget-message", BUDGET_MESSAGE] if capped else []
@@ -392,12 +433,13 @@ class Auto(Run):
 
 
 def rank(cands, sweeps, budget):
-    """candidates by refusals at the kl budget, each carrying the weight that reaches it."""
+    """candidates by refusals at the kl budget, each carrying the weight that reaches it,
+    around which it is swept from now on."""
     out = []
     for c in cands:
         at = at_budget(sweeps[f"{key(c)}.gguf"], budget)
         weight = round(c["weight"] * at["scale"], 3) if at["scale"] >= MIN_SCALE else c["weight"]
-        out.append({**at, "cand": {**c, "weight": weight}})
+        out.append({**at, "cand": {**{k: v for k, v in c.items() if k != "wide"}, "weight": weight}})
     return sorted(out, key=lambda x: (x["refusals"], x["kl"]))
 
 
@@ -439,7 +481,10 @@ def parse_args(argv):
     p.add_argument("--train-data", help="filtered training sets from another run's OUT/data")
     g = p.add_argument_group("effort")
     g.add_argument("--first-prompts", type=int, default=FIRST_PROMPTS, help="round 1's prompts, doubled each round")
-    g.add_argument("--beam", type=int, default=BEAM, help="leaders each round refines")
+    g.add_argument("--beam", type=int, default=BEAM,
+                   help="most leaders each round refines: each shape's best, and near ties of the leader")
+    g.add_argument("--report-prompts", type=int, default=REPORT_PROMPTS,
+                   help=f"held-out prompts every promotion is decided on (at most {SELECT_OFFSET})")
     g.add_argument("--max-candidates", type=int, default=MAX_CANDIDATES)
     g.add_argument("--train-limit", type=int, default=0)
     g.add_argument("--think-prompts", type=int, default=THINK_PROMPTS,

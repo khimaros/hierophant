@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import hierophant_auto as auto
 
 LOOSE_KLD = 100  # the tiny model's kl is far above any real budget
+REPORT_PROMPTS = 6
 
 
 def point(scale, refusals, kl):
@@ -54,25 +55,68 @@ class Candidates(unittest.TestCase):
         indices, step = auto.grid(48)
         self.assertEqual((indices[0], indices[-1]), (14, 43))
         self.assertTrue(all(1 <= i <= 47 for i in indices))
-        self.assertAlmostEqual(step, 2.4)
+        self.assertAlmostEqual(step, 4.8)
+        self.assertEqual(len(indices), 7)
 
-    def test_neighbours_vary_one_thing_at_a_time(self):
-        got = {auto.key(c) for c in auto.proposals([cand(33, pcs=8)], 1, 48, residual_for=1)}
+    def test_neighbours_vary_one_thing_and_pcs_steps_to_its_nearest_counts(self):
+        got = {auto.key(c) for c in auto.proposals([cand(33, pcs=8)], 1, 48, residual=True)}
         self.assertEqual(got, {"L32-pcs8", "L34-pcs8", "L33-pcs4", "L33-pcs16", "L33-pcs8-res"})
 
-    def test_only_the_leaders_get_a_residual_and_layers_stay_in_range(self):
-        got = {auto.key(c) for c in auto.proposals([cand(47), cand(20)], 1, 48, residual_for=1)}
-        self.assertIn("L47-res", got)
-        self.assertNotIn("L20-res", got)
-        self.assertNotIn("L48", got)
+    def test_a_residual_member_only_moves_its_layer(self):
+        # any other change to it needs a capture of its own
+        got = {auto.key(c) for c in auto.proposals([cand(33, residual=True)], 1, 48, residual=True)}
+        self.assertEqual(got, {"L32-res", "L34-res"})
 
-    def test_the_big_wins_come_first_when_candidates_are_capped(self):
-        got = [auto.key(c) for c in auto.proposals([cand(33)], 1, 48, residual_for=1)]
-        self.assertEqual(got[:3], ["L33-res", "L33-pcs4", "L32"])
+    def test_every_member_gets_a_residual_and_layers_stay_in_range(self):
+        got = {auto.key(c) for c in auto.proposals([cand(47), cand(20)], 1, 48, residual=True)}
+        self.assertTrue({"L47-res", "L20-res"} <= got)
+        self.assertNotIn("L48", got)
+        self.assertFalse(any(k.endswith("-res") for k in
+                             (auto.key(c) for c in auto.proposals([cand(33)], 1, 48, residual=False))))
+
+    def test_the_cheap_moves_come_first_for_every_member_when_capped(self):
+        # layers share one pass over the weights; a residual needs a filter and a capture
+        got = [auto.key(c) for c in auto.proposals([cand(33), cand(20, residual=True), cand(20)], 1, 48,
+                                                   residual=True)]
+        self.assertEqual(got, ["L32", "L34", "L19", "L21", "L33-pcs4", "L20-pcs4", "L33-res", "L20-res",
+                               "L19-res", "L21-res"])
+
+    def test_a_changed_shape_is_swept_wide(self):
+        props = {auto.key(c): c for c in auto.proposals([cand(33)], 1, 48, residual=True)}
+        self.assertTrue(props["L33-res"]["wide"])
+        self.assertTrue(props["L33-pcs4"]["wide"])
+        self.assertFalse(props["L34"].get("wide"))
 
     def test_indices_are_kept_to_quarter_layers(self):
-        got = {c["index"] for c in auto.proposals([cand(33)], 0.6, 48, residual_for=0)}
+        got = {c["index"] for c in auto.proposals([cand(33)], 0.6, 48, residual=False)}
         self.assertEqual(got, {32.5, 33.5, 33})
+
+
+def ranked(*rows):
+    return [{"refusals": r, "kl": 0.1, "cand": c} for c, r in rows]
+
+
+class Beam(unittest.TestCase):
+    """the beam keeps one leader per shape (pcs, residual), and more of a shape only
+    while they are within a standard error of the leader: closer is noise."""
+
+    def test_near_ties_of_one_shape_stay_and_a_distant_one_goes(self):
+        got = auto.select_beam(ranked((cand(34), 0.10), (cand(33), 0.11), (cand(30), 0.30)), n=128, size=3)
+        self.assertEqual([auto.key(c) for c in got], ["L34", "L33"])
+
+    def test_every_shape_keeps_its_best(self):
+        got = auto.select_beam(ranked((cand(34), 0.05), (cand(33), 0.30), (cand(33, pcs=8), 0.30),
+                                      (cand(34, residual=True), 0.32)), n=400, size=3)
+        self.assertEqual([auto.key(c) for c in got], ["L34", "L33-pcs8", "L34-res"])
+
+    def test_the_size_caps_it(self):
+        rows = [(cand(30 + i), 0.10) for i in range(6)]
+        self.assertEqual(len(auto.select_beam(ranked(*rows), n=32, size=4)), 4)
+
+    def test_rank_forgets_the_wide_sweep_once_a_weight_is_found(self):
+        sweeps = {"L33-res.gguf": [point(0, 1.0, 0), point(1, 0.2, 0.2)]}
+        got = auto.rank([{**cand(33, residual=True), "wide": True}], sweeps, 0.1)
+        self.assertNotIn("wide", got[0]["cand"])
 
 
 class Convergence(unittest.TestCase):
@@ -108,6 +152,7 @@ def run_auto(out, *args):
            "--first-prompts", "4", "--beam", "2", "--max-candidates", "4", "--train-limit", "40",
            "--max-kld", LOOSE_KLD, "--max-tokens", "8", "--kld-ctx", "128", "--think-limit", "2",
            "--think-max-tokens", "16", "--think-prompts", "2", "--think-budget", "4", "-np", "2",
+           "--report-prompts", REPORT_PROMPTS,
            "--server", str(LLAMA_SERVER),
            "--perplexity", str(LLAMA_PERPLEXITY), *args]
     return raw(cmd)
@@ -167,9 +212,18 @@ class Auto(unittest.TestCase):
         self.assertNotIn("sites [", self.first.stdout)
         self.assertNotIn("hierophant adapter (log:", self.first.stdout)
         self.assertIn("\r", self.first.stdout)
+        # the round's stage prefixes every bar drawn in it, and the round ends on a line of its own
+        self.assertRegex(self.first.stdout, r"round 1 builds 0/4 [\d:]+ \| round-1 builds \[")
+        self.assertRegex(self.first.stdout, r"round 1 select-wide 1/4 [\d:]+ \| sweep \d+/\d+ [\d:]+ \| ")
+        self.assertRegex(self.first.stdout, r"round 1 \[#{24}\] 4/4 100%")
         log = (self.out / "logs" / "round-1-report.log").read_text()
         self.assertNotIn("\r", log)
         self.assertRegex(log, r"base replies \[#{24}\] (\d+)/\1 100%")
+
+    def test_every_round_reports_on_the_same_held_out_prompts(self):
+        for rnd in (1, 2):
+            r = json.loads((self.out / f"round-{rnd}" / "round.json").read_text())
+            self.assertEqual(r["best"]["n"], REPORT_PROMPTS)
 
     def test_round_two_varies_the_leaders(self):
         r2 = json.loads((self.out / "round-2" / "round.json").read_text())

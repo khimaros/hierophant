@@ -37,7 +37,7 @@ BIN = ROOT / "build" / "bin"
 DATA = ROOT / "data"
 sys.path.insert(0, str(SCRIPTS))
 from hierophant_eval import add_model_args, model_flags, pick
-from progress import CLEAR, COUNT
+from progress import CLEAR, COUNT, around, fit
 
 STEPS = ["filter", "capture", "split", "search", "build", "residual", "confirm", "think", "summary"]
 # options that say how to run, not what to make: changing them needs no --from.
@@ -141,7 +141,7 @@ class Run:
         if self.bar and (m := COUNT.match(seg)) and m["label"] in self.rollup:
             self.bar.part(seg)
         elif self.progress:
-            print(seg, end="", flush=True)
+            print(fit(around() + seg.replace(CLEAR, "").rstrip("\r")) + CLEAR + "\r", end="", flush=True)
         return self.progress
 
     @property

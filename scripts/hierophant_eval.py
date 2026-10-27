@@ -24,11 +24,12 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from itertools import zip_longest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gguf_lite import Reader
-from progress import Bar
+from progress import Bar, outer
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "build" / "bin"
@@ -86,9 +87,11 @@ did the assistant refuse, deflect, or answer with warnings instead of help? answ
 
 
 def load_prompts(paths, limit=0, offset=0):
-    """prompts offset.. offset+limit of one-per-line files, a comma-separated list
-    pooled in order (all after offset without a limit)."""
-    out = [unescape(line) for path in str(paths).split(",") for line in Path(path).read_text().splitlines() if line]
+    """prompts offset.. offset+limit of one-per-line files (all after offset without a
+    limit). a comma-separated list is pooled taking each file's next prompt in turn, so
+    any slice mixes the sets until the shorter ones run out."""
+    sets = [[unescape(line) for line in Path(path).read_text().splitlines() if line] for path in str(paths).split(",")]
+    out = [p for row in zip_longest(*sets) for p in row if p is not None]
     return out[offset:offset + limit] if limit else out[offset:]
 
 
@@ -471,16 +474,18 @@ def saved(point):
     return {k: v for k, v in point.items() if k not in ("dists", "prefixes")}
 
 
-def evaluate_all(server, judge, harmful, harmless, scales, workers):
-    """{adapter path: sweep} for every adapter the server loaded."""
+def evaluate_all(server, judge, harmful, harmless, scales, workers, sweep):
+    """{adapter path: sweep} for every adapter the server loaded, each point counted on sweep."""
     with ThreadPoolExecutor(workers) as pool:
         base = score(server, pool, judge, OFF, harmful, harmless, label="base")
+        sweep.update()
         out = {}
         for i, lora in enumerate(server.adapters):
             out[lora] = []
             for s in scales:
                 name = f"{Path(lora).name} scale {s:g}"
                 point = base if s == 0 else score(server, pool, judge, [(i, s)], harmful, harmless, base, name)
+                sweep.update(1 if s else 0)
                 r = {"scale": s, **saved(point)}
                 print(f"{name}: refusals {r['refusals']:.3f} kld {r['kld']:.4f} top1_same {r['top1_same']:.3f} "
                       f"reply_logp {r['reply_logp']:.3f} unfinished {r['unfinished']:.3f} loops {r['loops']:.3f}",
@@ -514,8 +519,9 @@ def chunk_bar(cmd, label, total):
     return p.wait(), out.decode(errors="replace")
 
 
-def sequence_klds(args, sweeps, server):
-    """llama-perplexity's kl over every position of --kld-text, added to each sweep point.
+def sequence_klds(args, sweeps, server, sweep):
+    """llama-perplexity's kl over every position of --kld-text, added to each sweep point
+    and counted on sweep.
     each run is cached like a request; the base's logits are only computed for a run that
     is not (they are too big to keep: every position's whole vocabulary)."""
     text = sha256(args.kld_text)
@@ -539,6 +545,7 @@ def sequence_klds(args, sweeps, server):
                 parts = ["kld_seq", str(args.model), server.who([(i, r["scale"])]), text, args.kld_ctx,
                          args.kld_chunks]
                 r["kld_seq"], r["same_top_p_seq"] = server.cache.memo(parts, lambda lo=lora, s=r["scale"]: run(lo, s))
+                sweep.update()
                 print(f"{Path(lora).name} scale {r['scale']:g}: kld over {Path(args.kld_text).name} {r['kld_seq']:.4f}")
 
 
@@ -769,14 +776,17 @@ def main(argv):
     scales = sorted({0.0, *map(float, args.scales.split(","))})
     cache = Cache(args.cache or (args.results and f"{args.results}{CACHE_SUFFIX}"))
     server = Server(args, cache=cache)
-    try:
-        sweeps = evaluate_all(server, Judge(args, server), harmful, harmless, scales, args.parallel)
-    finally:
-        server.close()
-    if args.think:
-        args.reasoning_effort = server.cache.get(server.effort_key())
-    if args.kld_text:
-        sequence_klds(args, sweeps, server)
+    points = len(server.adapters) * (len(scales) - 1)
+    # the base, each adapter's scales, and with a kl text each one's kl run
+    with outer(args.progress, "sweep", 1 + points * (2 if args.kld_text else 1)) as sweep:
+        try:
+            sweeps = evaluate_all(server, Judge(args, server), harmful, harmless, scales, args.parallel, sweep)
+        finally:
+            server.close()
+        if args.think:
+            args.reasoning_effort = server.cache.get(server.effort_key())
+        if args.kld_text:
+            sequence_klds(args, sweeps, server, sweep)
     if args.results:
         named = {Path(lora).name: results for lora, results in sweeps.items()}
         Path(args.results).write_text(json.dumps(named, indent=2) + "\n")

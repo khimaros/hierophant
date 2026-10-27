@@ -143,8 +143,27 @@ small r component.
     cache.
   - convergence counts rounds at full prompts in which no different recipe
     took over; refining the best's own weight does not count as progress.
-  - proposals come in the order they paid off on qwen3.8 (residual, pcs,
-    index), so a capped round tries the likeliest gains first.
+  - proposals come cheapest first (index, the nearest pcs counts,
+    residual, a residual member's index), so a capped round still moves
+    the layer. on qwen3.8, residual and every-pcs proposals filled each
+    round's slots, the layer stopped moving after round 1, and pcs
+    variants of residual members each needed their own filter and capture
+    (an hour of builds in one round) while losing. pcs steps one count at
+    a time: a count that wins joins the beam and its neighbours follow.
+  - the beam keeps each shape's (pcs, residual) best, then near ties: on
+    qwen3.8 a beam of neighbouring indices of one recipe crowded out the
+    pcs and residual variants, which were then never refined. a near tie
+    is within the standard error of a difference at the round's prompts;
+    round 1 starts at 128 prompts, since at 32 the noise (+-0.05) dwarfed
+    what candidates differ by and the step halving locked onto it.
+  - a candidate whose shape changed is swept wide again: adding a
+    residual raises the kl per unit weight, so its budget point fell below
+    the narrow sweep around the parent's weight and it was compared at a
+    lower kl than its rivals.
+  - promotion is decided on the same `--report-prompts` every round, and
+    pooled prompt files alternate, so a report's number means the same
+    from round to round; growing it with the round, in file order, made an
+    unchanged best's refusals rise as llm-lat prompts joined jailbreakbench.
   - promotion compares the worse of thinking-off and short-thinking
     refusals. short thinking is a reasoning budget, which llama-server's
     sampler enforces from the think tags it detects and so works whatever
@@ -185,6 +204,13 @@ small r component.
   several commands (auto: a round's builds): the children's bars named in
   `rollup` are parsed back (`progress.COUNT`) and advance it by the share
   of the unit under way, so it moves per site without a bar per build.
+  an outer bar (a round's stages, an eval's whole sweep) is opened with
+  `with` and never drawn alone, which would leave a redraw for the next
+  printed line to overwrite: it prefixes every bar drawn while it is open,
+  the children's included (`Run.redraw`), and closes on a line. so the
+  prefix nests across processes without a terminal protocol, and the rollup
+  regex skips it. only a terminal's lines are cut to its width; a pipe gets
+  the whole line for the parent to parse.
 - `scripts/gguf_lite.py` reads gguf metadata and f32/f16 tensors with the
   standard library, for the sidecar and for tests that check the math
   independently of the c++ code.
