@@ -67,5 +67,6 @@ a second copy of the weights.
   REPO[:QUANT]`, `--hf-file`), including split models, and is resolved as
   llama-server resolves it: missing files are downloaded into the
   huggingface cache, and `--offline` uses only the cache.
-- R12. the llama.cpp commit is pinned, and the build that writes an adapter
-  is the build that validates it.
+- R12. the llama.cpp commit a run builds on is recorded with its adapter,
+  for reproducibility: a checkout may move between runs. the build that
+  writes an adapter is the build that validates it.

@@ -1,7 +1,7 @@
 """progress bars on a terminal, redrawn in place.
 
 each redraw ends in a carriage return and a bar's last line in a newline, so a
-parent reading the output (hierophant_pipeline's Run.sh) can tell the two
+parent reading the output (hierophant_run's Run.sh) can tell the two
 apart: it draws redraws in place and keeps only finished lines in its logs.
 
 one bar is drawn at a time. an outer bar (an eval's whole sweep, a round of the

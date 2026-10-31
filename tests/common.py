@@ -18,7 +18,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from gguf_lite import Reader
 
 BIN = ROOT / "build" / "bin"
-HIEROPHANT = BIN / "hierophant"
+CLI = ROOT / "hierophant"
+HIEROPHANT = BIN / "hierophant-core"
 LLAMA_SERVER = BIN / "llama-server"
 LLAMA_PERPLEXITY = BIN / "llama-perplexity"
 DATA = ROOT / "data"

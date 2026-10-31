@@ -33,7 +33,7 @@ if(NOT LLAMA_CPP_BUILT_COMMIT STREQUAL LLAMA_CPP_COMMIT)
     message(WARNING "llama.cpp source is at '${LLAMA_CPP_BUILT_COMMIT}', pinned commit is ${LLAMA_CPP_COMMIT}")
 endif()
 
-add_executable(hierophant
+add_executable(hierophant-core
     src/main.cpp
     src/hf_cache.cpp
     src/model_file.cpp
@@ -42,5 +42,5 @@ add_executable(hierophant
     src/capture.cpp
     src/kl.cpp
     src/adapter.cpp)
-target_link_libraries(hierophant PRIVATE llama llama-common ggml)
-target_compile_definitions(hierophant PRIVATE LLAMA_CPP_COMMIT="${LLAMA_CPP_BUILT_COMMIT}")
+target_link_libraries(hierophant-core PRIVATE llama llama-common ggml)
+target_compile_definitions(hierophant-core PRIVATE LLAMA_CPP_COMMIT="${LLAMA_CPP_BUILT_COMMIT}")

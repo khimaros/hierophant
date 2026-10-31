@@ -1,0 +1,25 @@
+[model]
+name = "LFM3-Omni-2B"
+repo = "LiquidAI/LFM3-Omni-2B-GGUF"
+license = "lfm1.0" # restricted in aimbot's registry: read its terms before publishing
+
+[quant.Q8_0]
+file = "LFM3-Omni-2B-Q8_0.gguf"
+sha256 = "59118f661eaacb93d204723d76355b53347f0940b508c11412f6290fd49158d4"
+recipe = { index = 14, pcs = 0, residual = false }
+weight = 0.928
+scale = 0.99
+
+[quant.Q8_0.eval]
+refusals = 0.08
+base = 0.97
+n = 300
+kl_first_token = 0.0492
+kl_text = 0.0105
+think = 0.1172
+think_base = 0.9609
+think_n = 128
+loops = 0.2
+full_refusals = 0.12
+full_n = 50
+llama_cpp = "aa588a3463357ee990b314f41dda242869130704"

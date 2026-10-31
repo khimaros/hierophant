@@ -1,18 +1,28 @@
 """the automated search: its scoring and proposals, and two rounds on the tiny dense model."""
 
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import threading
+import time
+import tomllib
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
-from common import LLAMA_SERVER, ROOT, TIED, Reader, raw, tmpdir
+from common import CLI, LLAMA_SERVER, ROOT, TIED, Reader, raw, tmpdir
 
-AUTO = ROOT / "scripts" / "hierophant_auto.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 import hierophant_auto as auto
+import hierophant_config
+from hierophant_config import ConfigError
 
 LOOSE_KLD = 100  # the tiny model's kl is far above any real budget
 REPORT_PROMPTS = 6
+SLOW_SECONDS = 10
 
 
 def point(scale, refusals, kl):
@@ -214,6 +224,32 @@ class Halving(unittest.TestCase):
         self.assertNotIn("L36", got)
         self.assertNotIn("L38", got)
 
+    def test_lfm3_s_last_halving_round_gets_the_top_eight_and_their_residuals(self):
+        # within noise of the cut, 16 of 17 survived 256 prompts, so at most 8 never came about
+        # and the search left halving without a residual tried
+        scores = (("L9-pcs8", 0.070), ("L15-pcs8", 0.074), ("L16", 0.074), ("L14", 0.074), ("L9", 0.082),
+                  ("L16-pcs8", 0.082), ("L14-pcs8", 0.086), ("L13", 0.086), ("L10-pcs8", 0.086), ("L12-pcs8", 0.086),
+                  ("L17-pcs8", 0.086), ("L8-pcs8", 0.090), ("L15", 0.090), ("L13-pcs8", 0.102), ("L12", 0.102),
+                  ("L11-pcs8", 0.102), ("L10", 0.105))
+        rows = ranked(*((hierophant_config.parse_recipe(k) | {"weight": 1.0}, r) for k, r in scores))
+        a = auto.parse_args(["-m", "model.gguf"])
+        nxt, beam = auto.plan(rows, True, n=256, pool=402, seen=set(), a=a)
+        self.assertEqual(beam, [])
+        top = [k for k, _ in scores[:auto.RESIDUAL_SURVIVORS]]
+        self.assertEqual([auto.key(c) for c in nxt], top + [f"{k}-res" for k in top])
+
+    def test_before_the_last_round_many_survivors_get_no_residuals(self):
+        rows = ranked(*((cand(14 + i), 0.08 + i / 1000) for i in range(17)))
+        a = auto.parse_args(["-m", "model.gguf"])
+        nxt, _ = auto.plan(rows, True, n=128, pool=402, seen=set(), a=a)
+        self.assertGreater(len(nxt), auto.RESIDUAL_SURVIVORS)
+        self.assertFalse(any(c["residual"] for c in nxt))
+
+    def test_a_last_round_that_fits_the_beam_ends_halving(self):
+        rows = ranked((cand(14), 0.05), (cand(15), 0.06), (cand(16), 0.5), (cand(17), 0.6))
+        a = auto.parse_args(["-m", "model.gguf"])
+        self.assertEqual(auto.plan(rows, True, n=256, pool=402, seen=set(), a=a)[0], [])
+
     def test_it_ends_at_full_prompts_however_many_tie(self):
         # more prompts would split a tie, and there are no more: a model refusing nothing
         # anywhere would halve forever
@@ -270,8 +306,8 @@ class Promotion(unittest.TestCase):
         self.assertFalse(auto.beats({"refusals": 0.2}, {"refusals": 0.2}))
 
 
-def run_auto(out, *args, indices=("--indices", "15,20")):
-    cmd = [sys.executable, "-I", str(AUTO), "-m", str(TIED), "--out", str(out), *indices,
+def run_auto(out, *args, indices=("--indices", "15,20"), command="build"):
+    cmd = [CLI, command, TIED, "--out", out, *indices,
            "--first-prompts", "4", "--beam", "2", "--max-candidates", "4", "--train-limit", "40",
            "--max-kld", LOOSE_KLD, "--max-tokens", "8", "--kld-ctx", "128", "--think-limit", "2",
            "--think-max-tokens", "16", "--think-prompts", "2", "--think-budget", "4", "-np", "2",
@@ -290,7 +326,7 @@ class Auto(unittest.TestCase):
         refine = ("--beam", "4", "--max-candidates", "6")
         cls.first = run_auto(cls.out, "--rounds", "2", "--progress", *refine)
         cls.again = run_auto(cls.out, "--rounds", "2", *refine)
-        cls.status = run_auto(cls.out, "--status")
+        cls.status = run_auto(cls.out, command="status")
 
     def test_both_rounds_run_and_the_best_is_always_on_disk(self):
         self.assertEqual(self.first.returncode, 0, self.first.stdout + self.first.stderr)
@@ -312,8 +348,17 @@ class Auto(unittest.TestCase):
         text = (self.out / "best.txt").read_text()
         self.assertIn(f"--lora-scaled {self.out / 'best.gguf'}:", text)
         self.assertNotIn("best.gguf:0\n", text)
-        self.assertIn("thinking on:", text)
+        self.assertIn("full replies, thinking on: refusals", text)
+        self.assertIn("by markers", text)
+        self.assertIn("by the base as judge", text)
+        self.assertIn("no reasoning seen", text)
         self.assertIn("held-out, short thinking: refusals", text)
+        side = json.loads((self.out / "best.json").read_text())
+        self.assertIn(f"built with llama.cpp {side['llama_cpp']}\n", text)
+
+    def test_the_sidecar_keeps_the_final_check_s_scores(self):
+        final = json.loads((self.out / "best.json").read_text())["eval"]["final"]
+        self.assertEqual(sorted(final), ["loops", "markers", "n", "reasoned", "refusals", "unfinished"])
 
     def test_later_rounds_reuse_what_earlier_ones_scored(self):
         # round 2's report repeats round 1's prompts for the base (and a kept incumbent)
@@ -394,7 +439,8 @@ class Resume(unittest.TestCase):
 
     def test_an_unrecorded_round_is_redone_from_its_cache(self):
         out = tmpdir(self.addCleanup) / "run"
-        first = run_auto(out, "--rounds", "1", "--verbose")
+        # an unrecorded round has not been pruned; recording it is what this test undoes
+        first = run_auto(out, "--rounds", "1", "--verbose", "--keep-rounds")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         # --verbose streams every command and its own progress
         self.assertIn("$ ", first.stdout)
@@ -446,7 +492,7 @@ class ScreenLayers(unittest.TestCase):
 
     def test_screen_only_ranks_beside_round_one_and_leaves_the_run_alone(self):
         state = (self.out / "state.json").read_text()
-        proc = run_auto(self.out, "--screen-only", "--screen-prompts", "4", indices=())
+        proc = run_auto(self.out, "--screen-prompts", "4", indices=(), command="screen")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual((self.out / "state.json").read_text(), state)
         self.assertNotIn("== round", proc.stdout)
@@ -478,6 +524,343 @@ class HalvingRun(unittest.TestCase):
         self.assertTrue(got <= want)
         self.assertEqual(r2["n"], 8)
         self.assertTrue(json.loads((self.out / "state.json").read_text())["halving"])
+
+
+class DefaultOut(unittest.TestCase):
+    """without --out, each model gets its own directory under ./out."""
+
+    @staticmethod
+    def out(**fields):
+        return auto.default_out(SimpleNamespace(**{"model": None, "hf_repo": None, "hf_file": None, **fields}))
+
+    def test_a_repo_and_quant(self):
+        self.assertEqual(self.out(hf_repo="unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS"),
+                         Path("out") / "unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS")
+
+    def test_a_repo_and_file(self):
+        self.assertEqual(self.out(hf_repo="org/m-GGUF", hf_file="Q8_0/m-Q8_0-00001-of-00002.gguf"),
+                         Path("out") / "org--m-GGUF--m-Q8_0-00001-of-00002")
+
+    def test_a_bare_repo(self):
+        self.assertEqual(self.out(hf_repo="org/m-GGUF"), Path("out") / "org--m-GGUF")
+
+    def test_a_local_file(self):
+        self.assertEqual(self.out(model="/models/tiny-Q8_0.gguf"), Path("out") / "tiny-Q8_0")
+
+
+class Streaming(unittest.TestCase):
+    """a step's output reaches its log while the step still runs, not when it exits."""
+
+    def test_script_output_is_logged_before_the_script_exits(self):
+        d = tmpdir(self.addCleanup)
+        slow = d / "slow.py"
+        slow.write_text(f"import time\nprint('started')\ntime.sleep({SLOW_SECONDS})\n")
+        r = auto.Auto(auto.parse_args(["-m", str(TIED), "--out", str(d / "out"), "--indices", "1"]))
+        worker = threading.Thread(target=r.script, args=("slow", slow))
+        worker.start()
+        self.addCleanup(worker.join)
+        log = d / "out" / "logs" / "slow.log"
+        deadline = time.time() + SLOW_SECONDS / 2
+        while time.time() < deadline and "started" not in (log.read_text() if log.exists() else ""):
+            time.sleep(0.2)
+        self.assertIn("started", log.read_text())
+
+
+class ShortThinking(unittest.TestCase):
+    """short thinking is scored where the report scored each adapter: scale 1 against a
+    report at 0.97 compared two different strengths. the tiny model's report lands on scale
+    0, so this drives think_score with an eval that answers at whatever scale it is asked."""
+
+    def run_think(self, reasoning=""):
+        d = tmpdir(self.addCleanup)
+        r = auto.Auto(auto.parse_args(["-m", "model.gguf", "--out", str(d / "run")]))
+        self.asked = []
+
+        def fake_eval(label, *args):
+            flags = list(map(str, args))
+            scale = float(flags[flags.index("--scales") + 1])
+            names = [Path(flags[i + 1]).name for i, x in enumerate(flags) if x == "--lora"]
+            self.asked.append((scale, names))
+            replies = [{"reply": "yes", "reasoning": reasoning}]
+            Path(flags[flags.index("--results") + 1]).write_text(json.dumps({n: [
+                {"scale": 0, "refusals": 0.9, "replies": replies}, {"scale": scale, "refusals": scale / 10,
+                                                                    "replies": replies}] for n in names}))
+
+        r.eval = fake_eval
+        scales = {d / "a.gguf": 0.97, d / "b.gguf": 1.03, d / "c.gguf": 0.97}
+        return r.think_score("x", d, scales, 4), d
+
+    def test_each_adapter_is_scored_at_its_own_scale_sharing_a_run_with_its_equals(self):
+        got, d = self.run_think()
+        self.assertEqual(self.asked, [(0.97, ["a.gguf", "c.gguf"]), (1.03, ["b.gguf"])])
+        self.assertAlmostEqual(got["a.gguf"]["think"], 0.097)
+        self.assertAlmostEqual(got["b.gguf"]["think"], 0.103)
+        self.assertEqual(sorted(json.loads((d / "think.json").read_text())), ["a.gguf", "b.gguf", "c.gguf"])
+
+    def test_replies_without_any_reasoning_say_so(self):
+        # lfm3 never reasoned, so its short thinking scores were plain replies
+        self.assertEqual(self.run_think()[0]["a.gguf"]["think_reasoned"], 0)
+        self.assertEqual(self.run_think("because")[0]["a.gguf"]["think_reasoned"], 1)
+
+
+class ResidualRetry(unittest.TestCase):
+    """a residual is captured under the adapter at its weight before that, and on lfm3 L16-res
+    scored 0.211 at a capture from weight 1.03 and 0.080 once recaptured near where it lands."""
+
+    def setUp(self):
+        self.d = tmpdir(self.addCleanup)
+        self.r = auto.Auto(auto.parse_args(["-m", "model.gguf", "--out", str(self.d / "run")]))
+        self.built = []
+        self.r.build = lambda d, cands: self.built.extend(auto.key(c) for c in cands) or cands
+        self.r.select = lambda d, cands, n: {f"{auto.key(c)}.gguf": [point(1, 0.08, 0.05)] for c in cands}
+
+    def captured(self, name, weight):
+        d = self.r.root / "residual" / name
+        d.mkdir(parents=True)
+        (d / "weight.json").write_text(json.dumps({"weight": weight}))
+
+    def settle(self, *rows):
+        return self.r.settle_residuals(self.r.out / "round-5", ranked(*rows), 402)
+
+    def test_a_residual_far_from_its_capture_is_scored_again_and_reranked(self):
+        self.captured("L16", 1.03)
+        got = self.settle((cand(14), 0.09), (cand(16, residual=True, weight=0.741), 0.211))
+        self.assertEqual(self.built, ["L16-res"])
+        self.assertEqual([(auto.key(x["cand"]), x["refusals"]) for x in got], [("L16-res", 0.08), ("L14", 0.09)])
+
+    def test_a_residual_near_its_capture_stands(self):
+        self.captured("L16", 0.78)
+        got = self.settle((cand(16, residual=True, weight=0.741), 0.211))
+        self.assertEqual(self.built, [])
+        self.assertEqual(got[0]["refusals"], 0.211)
+
+    def test_without_any_residual_nothing_runs(self):
+        self.settle((cand(14), 0.09))
+        self.assertEqual(self.built, [])
+
+    def test_a_residual_with_too_few_prompts_for_a_capture_is_left_alone(self):
+        self.settle((cand(16, residual=True, weight=0.741), 0.211))
+        self.assertEqual(self.built, [])
+
+
+class Defaults(unittest.TestCase):
+    def test_the_kl_budget(self):
+        # lfm3: 0.1 bought 0.04 fewer refusals than 0.05, at twice the kl
+        self.assertEqual(auto.parse_args(["-m", "model.gguf"]).max_kld, 0.05)
+
+
+class Accepting(unittest.TestCase):
+    """a build fills an empty config and records a recipe's measurements for its quant, and
+    never replaces an accepted recipe."""
+
+    def args(self, *extra):
+        return auto.parse_args(["--hf-repo", "org/m-GGUF:Q8_0", *extra])
+
+    def test_a_converged_search_fills_an_empty_config(self):
+        st = {"best": {"key": "L3"}, "unchanged": auto.PATIENCE}
+        self.assertTrue(auto.should_accept(self.args(), st, None))
+        self.assertTrue(auto.should_accept(self.args(), st, {"quant": {"Q8_0": {}}}))
+
+    def test_a_search_stopped_early_is_not_accepted(self):
+        self.assertFalse(auto.should_accept(self.args(), {"best": {"key": "L3"}, "unchanged": 0}, None))
+
+    def test_a_search_never_replaces_an_accepted_recipe(self):
+        st = {"best": {"key": "L3"}, "unchanged": auto.PATIENCE}
+        self.assertFalse(auto.should_accept(self.args(), st, {"quant": {"Q8_0": {"recipe": {"index": 9}}}}))
+
+    def test_a_recipe_build_records_its_quant(self):
+        args = self.args("--recipe", "L9")
+        self.assertTrue(auto.should_accept(args, {"best": {"key": "L9"}, "unchanged": 0}, {"quant": {}}))
+
+    def test_no_accept_turns_both_off(self):
+        st = {"best": {"key": "L3"}, "unchanged": auto.PATIENCE}
+        self.assertFalse(auto.should_accept(self.args("--no-accept"), st, None))
+        self.assertFalse(auto.should_accept(self.args("--no-accept", "--recipe", "L9"), st, {}))
+
+    def test_a_local_file_has_no_config_to_fill(self):
+        args = auto.parse_args(["-m", "model.gguf"])
+        self.assertFalse(auto.should_accept(args, {"best": {"key": "L3"}, "unchanged": auto.PATIENCE}, None))
+
+    def test_a_bad_recipe_fails_before_anything_runs(self):
+        with self.assertRaises(ConfigError):
+            self.args("--recipe", "best")
+
+
+def touch(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x")
+    return path
+
+
+class Prune(unittest.TestCase):
+    """only what no later round will read: finished rounds' adapters and lost residuals."""
+
+    def setUp(self):
+        self.root = tmpdir(self.addCleanup)
+        self.state(self.root, round=2, candidates=[cand(33, pcs=8, residual=True)], best="L15-pcs8")
+
+    @staticmethod
+    def state(d, round, candidates=(), best=None):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "state.json").write_text(json.dumps({"round": round, "candidates": list(candidates), "beam": [],
+                                                  "best": {"key": best} if best else None}))
+
+    def residual(self, name):
+        d = self.root / "residual" / name
+        return [touch(d / "dirs.gguf"), touch(d / "under.gguf"), touch(d / "weight.json")]
+
+    def test_a_recorded_round_s_adapters_are_dead_and_its_scores_are_not(self):
+        dead = touch(self.root / "round-1" / "L3.gguf")
+        built = touch(self.root / "round-1" / "L3.gguf.built")
+        report = touch(self.root / "round-2" / "report" / "incumbent.gguf")
+        touch(self.root / "round-1" / "round.json")
+        touch(self.root / "round-2" / "report" / "L3.json")
+        self.assertEqual(sorted(auto.dead_files(self.root)), sorted([dead, built, report]))
+
+    def test_the_round_under_way_is_left_alone(self):
+        touch(self.root / "round-3" / "L3.gguf")
+        self.assertEqual(auto.dead_files(self.root), [])
+
+    def test_the_best_and_the_directions_are_left_alone(self):
+        for name in ("best.gguf", "dirs.gguf", "cache.jsonl"):
+            touch(self.root / name)
+        self.assertEqual(auto.dead_files(self.root), [])
+
+    def test_a_lost_residual_goes_with_its_marker_so_it_is_captured_again(self):
+        dirs, under, weight = self.residual("L20")
+        self.assertEqual(sorted(auto.dead_files(self.root)), sorted([dirs, under, weight]))
+
+    def test_a_residual_still_in_the_running_keeps_its_directions(self):
+        _, under, _ = self.residual("L33-pcs8")
+        self.assertEqual(auto.dead_files(self.root), [under])
+
+    def test_the_best_s_residual_keeps_its_directions(self):
+        _, under, _ = self.residual("L15-pcs8")
+        self.assertEqual(auto.dead_files(self.root), [under])
+
+    def test_an_unfinished_capture_is_left_alone(self):
+        touch(self.root / "residual" / "L20" / "under.gguf")
+        self.assertEqual(auto.dead_files(self.root), [])
+
+    def test_a_named_run_keeps_its_own_residuals_alive(self):
+        self.state(self.root / "runs" / "other", round=1, best="L20")
+        dead = touch(self.root / "runs" / "other" / "round-1" / "L20.gguf")
+        _, under, _ = self.residual("L20")
+        self.assertEqual(sorted(auto.dead_files(self.root)), sorted([dead, under]))
+
+
+class Finished(unittest.TestCase):
+    """the commands that read a finished run, on one run of the tiny model."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = tmpdir(cls.addClassCleanup)
+        cls.out, cls.configs = root / "run", root / "configs"
+        cls.configs.mkdir()
+        cls.env = {**os.environ, "HIEROPHANT_CONFIGS": str(cls.configs)}
+        cls.first = run_auto(cls.out, "--rounds", "1", "--beam", "4", "--max-candidates", "6")
+        cls.best = json.loads((cls.out / "state.json").read_text())["best"]
+
+    def cli(self, *args):
+        return subprocess.run([str(CLI), *map(str, args)], capture_output=True, text=True, check=False, env=self.env)
+
+    def test_it_runs_and_says_it_searched(self):
+        self.assertEqual(self.first.returncode, 0, self.first.stdout + self.first.stderr)
+        self.assertIn("== build: searching", self.first.stdout)
+
+    def test_a_finished_round_leaves_no_adapters_behind(self):
+        self.assertEqual(list((self.out / "round-1").rglob("*.gguf")), [])
+        self.assertTrue((self.out / "round-1" / "round.json").exists())
+        self.assertTrue((self.out / "best.gguf").exists())
+
+    def test_accept_writes_the_best_into_a_new_config(self):
+        p = self.cli("accept", "org/Tiny-GGUF:Q8_0", "--out", self.out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        config = tomllib.loads((self.configs / "org--Tiny-GGUF.toml").read_text())
+        self.assertEqual(config["model"]["name"], "Tiny")
+        q = config["quant"]["Q8_0"]
+        self.assertEqual(hierophant_config.recipe_name(q["recipe"]), self.best["key"])
+        self.assertEqual(q["eval"]["think_n"], self.best["think_n"])
+
+    def test_accept_needs_a_quant(self):
+        self.assertNotEqual(self.cli("accept", "org/Tiny-GGUF", "--out", self.out).returncode, 0)
+
+    def test_compare_scores_an_adapter_beside_the_best(self):
+        other = self.out / "other.gguf"
+        shutil.copy(self.out / "best.gguf", other)
+        p = run_auto(self.out, "--lora", other, indices=(), command="compare")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertRegex(p.stdout, r"\nbest +[\d.]+ +[\d.]+ +[\d.]+\n")
+        self.assertRegex(p.stdout, r"\nother +[\d.]+ +[\d.]+ +[\d.]+\n")
+
+    def test_serve_runs_the_server_on_the_best_at_its_scale(self):
+        fake = tmpdir(self.addCleanup) / "server"
+        fake.write_text('#!/bin/sh\necho "$@"\n')
+        fake.chmod(0o755)
+        p = self.cli("serve", TIED, "--out", self.out, "--server", fake, "--", "--port", "9")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        scale = json.loads((self.out / "best.json").read_text())["scale"] or 1
+        self.assertIn(f"--lora-scaled {(self.out / 'best.gguf').absolute()}:{scale:g}", p.stdout)
+        self.assertTrue(p.stdout.strip().endswith("--port 9"), p.stdout)
+
+    def test_chat_runs_llama_cli_on_the_best_at_its_scale(self):
+        fake = tmpdir(self.addCleanup) / "cli"
+        fake.write_text('#!/bin/sh\necho "$@"\n')
+        fake.chmod(0o755)
+        p = self.cli("chat", TIED, "--out", self.out, "--cli", fake, "--", "--temp", "0")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        scale = json.loads((self.out / "best.json").read_text())["scale"] or 1
+        self.assertIn(f"-m {TIED.absolute()} --lora-scaled {(self.out / 'best.gguf').absolute()}:{scale:g}", p.stdout)
+        self.assertTrue(p.stdout.strip().endswith("--temp 0"), p.stdout)
+
+    def test_chat_finds_the_real_llama_cli(self):
+        self.assertTrue((ROOT / "build" / "bin" / "llama-cli").exists())
+
+    def test_serve_without_a_best_says_so(self):
+        p = self.cli("serve", TIED, "--out", tmpdir(self.addCleanup))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("no best.gguf", p.stderr)
+
+    def test_prune_only_lists_unless_told(self):
+        keep = self.out / "round-1" / "planted.gguf"
+        keep.write_text("x")
+        self.addCleanup(keep.unlink, missing_ok=True)
+        p = self.cli("prune", TIED, "--out", self.out)
+        self.assertIn(str(keep), p.stdout)
+        self.assertTrue(keep.exists())
+        p = self.cli("prune", TIED, "--out", self.out, "--yes")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(keep.exists())
+
+
+class Recipe(unittest.TestCase):
+    """a known recipe needs one round, and a named run reuses what its directory has."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.out = tmpdir(cls.addClassCleanup) / "run"
+        cls.proc = run_auto(cls.out, "--recipe", "L15-pcs8", "--recipe-weight", "1.2", "--no-think-check", indices=())
+        cls.named = run_auto(cls.out, "--recipe", "L20", "--name", "other", "--no-think-check", "--keep-rounds",
+                             indices=())
+
+    def test_one_candidate_in_one_round(self):
+        self.assertEqual(self.proc.returncode, 0, self.proc.stdout + self.proc.stderr)
+        self.assertIn("== build: following recipe L15-pcs8", self.proc.stdout)
+        self.assertIn("(1 candidates", self.proc.stdout)
+        self.assertNotIn("== round 2", self.proc.stdout)
+        st = json.loads((self.out / "state.json").read_text())
+        self.assertEqual(st["best"]["key"], "L15-pcs8")
+
+    def test_a_named_run_reuses_the_capture_and_the_cache(self):
+        self.assertEqual(self.named.returncode, 0, self.named.stdout + self.named.stderr)
+        self.assertIn("capture: done", self.named.stdout)
+        run = self.out / "runs" / "other"
+        self.assertTrue((run / "best.gguf").exists())
+        self.assertFalse((run / "dirs.gguf").exists())
+        self.assertFalse((run / "cache.jsonl").exists())
+
+    def test_keep_rounds_keeps_the_adapters(self):
+        self.assertTrue(list((self.out / "runs" / "other" / "round-1").rglob("*.gguf")))
 
 
 def first_history(proc):

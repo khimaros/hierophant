@@ -1,0 +1,8 @@
+[model]
+name = "Qwen3.5-0.8B-MTP"
+repo = "unsloth/Qwen3.5-0.8B-MTP-GGUF"
+license = "apache-2.0"
+
+[quant.Q8_0]
+file = "Qwen3.5-0.8B-Q8_0.gguf"
+sha256 = "c54f8b67069c70085b98440de696b44da8250250ac69a961b41133def876e262"

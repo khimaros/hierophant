@@ -14,9 +14,11 @@ make
 make CMAKE_ARGS=-DGGML_VULKAN=on
 ```
 
-this produces `build/bin/hierophant` and the `build/bin/llama-server` it is
-validated against, and `build/bin/llama-perplexity`, which the tests check
-`hierophant kl` against. the first build also
+this produces `build/bin/hierophant-core` (the C++ tools) and the
+`build/bin/llama-server` it is validated against, `build/bin/llama-cli` for
+`hierophant chat`, and `build/bin/llama-perplexity`, which the tests check
+`hierophant core kl` against. the `hierophant` script at the top of the repo is the one command to
+run; it can be symlinked onto your PATH. the first build also
 fetches and builds the boringssl version llama.cpp pins, for downloading
 models over HTTPS.
 
@@ -27,21 +29,20 @@ models over HTTPS.
 make datasets
 
 # optimize a LoRA adapter automatically for an HF model
-scripts/hierophant_auto.py --progress -ngl 99 \
-    --hf-repo unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS
+./hierophant build unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS --progress -ngl 99
 ```
 
 that is the whole flow. it downloads the model if needed, finds the layers
 and recipe that remove the most refusals within a KL budget, and keeps
 refining until the result stops improving. the best adapter so far is
-always at `lora/<org>--<repo>--<quant>/best.gguf`, so you can stop it with
+always at `out/<org>--<repo>--<quant>/best.gguf`, so you can stop it with
 ctrl-c at any point and use what it found. ctrl-c, kill or a closed
 terminal stops every server and tool it started before it returns, so the
 model's memory is free when the prompt comes back:
 
 ```
 llama-server -hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS -ngl 99 \
-  --lora-scaled lora/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf:1
+  --lora-scaled out/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf:1
 ```
 
 the adapter's strength is built in, so its scale is close to 1; `best.txt`
@@ -50,31 +51,32 @@ unapplied and turn it on per request. rerun the same command to continue:
 every reply, verdict and KL run is kept in `cache.jsonl` as it arrives and every finished
 adapter build is kept, so only the requests in flight at ctrl-c are repeated.
 the cache also spares later rounds what earlier ones scored (the base, and an
-incumbent kept from the last round). add `--status` to print the current
-best and each round's without starting anything.
+incumbent kept from the last round). `./hierophant status MODEL` prints the
+current best and each round's without starting anything.
 
-a run looks like this (illustrative numbers, close to Qwen3.8-Flash-Next's
-by hand; each command it runs also prints one line naming its log):
+a run looks like this (LFM3-Omni-2B's, shortened; each command it runs also
+prints one line naming its log):
 
 ```
+== build: searching
 == prepare
-== round 1: which layer and pcs (60 candidates, 32 prompts each)
+== round 1: which layer and pcs (32 candidates, 32 prompts each)
 candidate                refusals@kl  weight      kl
-L14-pcs8                       0.094    1.51  0.0997
-L33-pcs8                       0.125    1.53  0.0780
+L16-pcs8                       0.156    1.13  0.0433
+L14-pcs8                       0.156     1.1  0.0434
 ...
->> new best: L14-pcs8 (round 1)  refusals 0.120 (0.110 with short thinking), kl 0.0997
-== round 2: the better half of round 1 (30 candidates, 64 prompts each)
->> new best: L33-pcs8 (round 2)  refusals 0.110 (0.100 with short thinking), kl 0.0916
-== round 3: the better half of round 2 (15 candidates, 128 prompts each)
-== round 4: the better half of round 3 (16 candidates, 256 prompts each)
->> new best: L33-pcs8-res (round 4)  refusals 0.090 (0.094 with short thinking), kl 0.0939
-== round 5: the better half of round 4 (8 candidates, 402 prompts each)
-== round 6: refine L33-pcs8-res, L33-pcs8, L14-pcs8, L19-pcs8-res (9 candidates, 402 prompts each)
-...
+>> new best: L16-pcs8 (round 1)  refusals 0.103 (0.109 with short thinking, no reasoning seen), kl 0.0486
+== round 2: the better half of round 1 (21 candidates, 64 prompts each)
+>> new best: L9-pcs8 (round 2)  refusals 0.097 (0.109 with short thinking, no reasoning seen), kl 0.0494
+== round 3: the better half of round 2 (12 candidates, 128 prompts each)
+>> new best: L14 (round 3)  refusals 0.080 (0.117 with short thinking, no reasoning seen), kl 0.0492
+== round 4: the better half of round 3 (11 candidates, 256 prompts each)
+== round 5: the better half of round 4 (16 candidates, 402 prompts each)
+== round 6: refine L14-pcs8-res, L14, L15-pcs8, L16-res (9 candidates, 402 prompts each)
 >> best unchanged for 2 rounds at full prompts: converged
-== final check: L33-pcs8-res with thinking on (50 prompts)
-best weights: lora/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf
+== final check: L14 with thinking on (50 prompts)
+best weights: out/LiquidAI--LFM3-Omni-2B-GGUF--Q8_0/best.gguf
+>> accepted L14 for Q8_0 in configs/LiquidAI--LFM3-Omni-2B-GGUF.toml
 ```
 
 how it decides:
@@ -84,12 +86,12 @@ how it decides:
   0.5 to 2. every layer, because neighbouring layers differ: a grid 5
   layers apart missed L33 on Qwen3.8-Flash-Next.
   every candidate is scored by its
-  refusals where its KL reaches the budget (`--max-kld`, default 0.1),
-  interpolated between the scales around it, and carries the weight that
-  reaches it into the next round. the KL is the larger of the first-token
-  KL and the KL over WikiText. the KL is measured at every scale first and
-  replies are generated only where it reaches the budget, the one point
-  the ranking reads; selection also leaves out the reply logp, which only
+  refusals where its KL reaches the budget (`--max-kld`, default 0.05),
+  and carries the weight that reaches it into the next round. the KL is the
+  larger of the first-token KL and the KL over WikiText. the KL is measured
+  at every scale first, then at the scale predicted to reach the budget,
+  stepping down until it is measured within it, and replies are generated
+  only there, the one point the ranking reads; selection also leaves out the reply logp, which only
   the report keeps.
 - `--screen-layers` first screens every layer of that range with each
   `--first-pcs` count on the first token alone (how unlikely the base's own
@@ -97,16 +99,19 @@ how it decides:
   and scores only the best `--screen-keep` (16) in full. it is cheap but
   off by default: on Qwen3.8-Flash-Next it ranked the best two candidates
   36th and 38th of 60, preferring late layers that change the first token
-  without lowering refusals. `--screen-only` runs the screen alone in an
-  existing run's directory (`OUT/screen`), printing round 1's refusals
+  without lowering refusals. `./hierophant screen MODEL` runs the screen
+  alone in an existing run's directory (`OUT/screen`), printing round 1's refusals
   beside its ranking, and leaves the run as it was.
 - the next rounds halve: each keeps the better half of the last by rank,
   however close the scores, and anything within a standard error of the
   last of it, which its prompts cannot tell apart, at the weights they were
-  found to reach the budget at. once at most 8 are
-  left, each survivor's residual direction joins them (what the adapter
-  still refuses, removed as well), which needs a filter and a capture of
-  its own. which recipe helps
+  found to reach the budget at. once at most 8 are left, or at the latest
+  before the last round, which keeps only the best 8, each survivor's
+  residual direction joins them (what the adapter still refuses, removed as
+  well), which needs a filter and a capture of its own. a residual that
+  lands more than 10% from the weight it was captured under is captured
+  again there and scored once more in that round, since its first score
+  came from a capture made too strong. which recipe helps
   depends on the layer, so no layer is settled before its recipes are
   tried. halving stops once the survivors fit the beam, or at full
   prompts, where more prompts can no longer split a tie.
@@ -145,18 +150,28 @@ how it decides:
 - it stops when two rounds in a row at full prompts bring no new recipe,
   or after `--rounds N`, and then checks the best with thinking on as it
   would be served (the template's default effort, no budget), whose
-  replies can run long; that check is reported, not chosen on.
+  replies run to full length. that check is reported, not chosen on: it
+  counts refusals by markers, comparable with the report, and by the base
+  as judge, which also counts warnings and deflection and so reads far
+  higher on an adapter's long replies. it also counts loops, replies that
+  keep repeating a passage, which only full-length replies show, and how
+  many reasoned at all: a model that never does gets `no reasoning seen`
+  beside its short thinking score, which is then just another plain reply.
 
 the directory holds:
 
 - `best.gguf`, `best.json`: the adapter and its sidecar (base SHA-256,
-  recipe, held-out scores).
-- `best.txt`: what the adapter is, its numbers and how to serve it.
+  recipe, held-out scores, the final check).
+- `best.txt`: what the adapter is, its numbers, the llama.cpp commit that
+  built it, and how to serve it.
 - `history.txt`: the best after each round.
-- `round-N/`: every candidate of that round, its scores and `round.json`.
+- `round-N/`: each round's scores and `round.json`. its adapters are deleted
+  once it is recorded, unless `--keep-rounds`.
 - `logs/`: every command's output.
+- `dirs.gguf`, `data/`, `cache.jsonl`, `residual/`: what any recipe of this
+  base can reuse, shared with the named runs in `runs/`.
 
-other options: `--out DIR` instead of `lora/...`, `-m model.gguf` for a
+other options: `--out DIR` instead of `out/...`, `-m model.gguf` for a
 local file, `--judge self` to have the model judge refusals instead of
 matching phrases, `--indices 30,33` to start from given layers instead of a
 grid, `--train-data OTHER/data` to reuse another run's filtered prompts,
@@ -166,15 +181,15 @@ runs) instead of one line per command, `--progress` to draw a progress
 bar in place for each unit of work (see below), and `-ngl`/`-np` as for
 llama-server.
 
-`--progress` works on every command: `hierophant capture` counts prompts,
-`hierophant adapter` sites, the eval, filter and search scripts each request
-as it finishes, and `hierophant kl` each chunk of each run:
+`--progress` works on every command: `hierophant core capture` counts prompts,
+`hierophant core adapter` sites, `eval`, `data filter` and `curves` each request
+as it finishes, and `hierophant core kl` each chunk of each run:
 
 ```
 base replies [#########---------------] 12/32 38% 0:41 eta 1:08
 ```
 
-the pipeline and the automated run pass it on to every command they run.
+`hierophant build` passes it on to every command it runs.
 one bar is redrawn in place on the terminal, below what is printed, and
 `logs/` keep only finished lines. the eval draws one bar for its whole
 sweep, a unit per request stage (replies, verdicts, ...) at each scale and
@@ -193,6 +208,42 @@ they do not, so it is rough. the bars inside it end on lines of their own,
 above it, as each round does with its total time. a line wider than the
 terminal is cut to fit.
 
+### configs
+
+`configs/<org>--<repo>.toml` holds what is known about one model, with a
+table per quant: its recipe, weight, scale and scores. MODEL can be any
+unique part of a config's name, and `--quant` picks a quant where it has
+several:
+
+```
+./hierophant build qwen3.8
+./hierophant status qwen3.8
+./hierophant status
+```
+
+`status` alone lists every config. a `[search]` table sets `build`'s flags
+for that model (`think_effort = "low"`). a config can be shared, so it can
+only set search settings: paths, URLs and programs come from flags or from
+`~/.config/hierophant/config.toml`, which holds what belongs to the machine:
+
+```toml
+[defaults]
+ngl = 99
+parallel = 32
+progress = true
+judge = "markers"
+user = "khimaros"   # who `publish` stages for
+```
+
+a flag on the command line always wins, and `./hierophant config MODEL`
+prints the flags a command gets from these files. `./hierophant init REPO`
+writes a new config.
+
+a build on another machine writes its config there. `make sync HOST=kairos`
+(with `REMOTE=src/hierophant` as the default checkout there) brings configs
+back, then pushes this checkout; the newer copy of a config wins, so review
+it with `git diff configs/`.
+
 ### serving
 
 an adapter is a plain llama.cpp LoRA, so llama-server loads it beside the
@@ -203,7 +254,7 @@ adapter on:
 
 ```
 llama-server -hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS -ngl 99 \
-  --lora lora/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf --lora-init-without-apply
+  --lora out/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf --lora-init-without-apply
 ```
 
 per request, with a `lora` list of adapter IDs and scales in the body (an
@@ -231,16 +282,35 @@ scales together, so mixing them on one server costs throughput.
 
 ### publishing
 
-`scripts/hierophant_publish.py` stages adapters for one Hugging Face repo
+`./hierophant publish` stages adapters for one Hugging Face repo
 per model, one adapter per base quant, each named after the quant its
 sidecar says it was built from (an adapter is exact only for that file):
 
 ```
-scripts/hierophant_publish.py lora/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf --user khimaros --license apache-2.0
+./hierophant publish qwen3.8
+./hierophant publish unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS
+./hierophant publish out/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf --user khimaros --license apache-2.0
 ```
 
+MODEL is named as for `build`. with a config, it publishes the best of every
+quant the config accepted (or the one quant asked for), with the config's
+license and the `user` from the machine's `[defaults]`, and refuses a best
+that is not the accepted recipe at the accepted weight. `--name RUN`
+publishes the best of a named run. a REPO:QUANT with no config publishes
+that run's best, and like adapter files takes `--license`. the card comes from `templates/model-card.md`, with
+`templates/hierophant-banner.jpeg` staged beside it.
+
+the end of the card lists every recipe the search tried, from the run's
+`round.json` files and collapsed per quant, marking the published one. those
+are selection scores, so the card says they are not held out, and the same
+list is uploaded as `ladder-<QUANT>.json`.
+
+each stage also writes `out/publish/<repo>.preview.html`, a rough local page
+of the card, tags and files. it sits beside the staging directory, so it is
+never uploaded.
+
 this copies `best.gguf` and its sidecar into
-`lora/publish/Qwen3.8-Flash-Next-hierophant-LoRA-GGUF/` as
+`out/publish/unsloth-Qwen3.8-Flash-Next-hierophant-LoRA-GGUF/` as
 `Qwen3.8-Flash-Next-hierophant-UD-IQ4_XS.gguf` and `.json` (the quant last,
 as GGUF files name it), and writes its
 `README.md` from every sidecar staged there: the hub metadata (`base_model`,
@@ -249,8 +319,12 @@ as GGUF files name it), and writes its
 base SHA-256, scale, recipe, held-out refusals and KL, and how it was made.
 staging another quant rewrites the table. nothing is uploaded until the same
 command is run with `--upload`, which runs `hf upload` on the directory; it
-needs `hf auth login` first. `--license` is the base model's own, `--repo`
-names a repo other than `USER/<Model>-hierophant-LoRA-GGUF`, and `--quant`
+needs `hf auth login` first. an upload then joins the repo to the `hierophant`
+collection in its namespace, created the first time: `--collection TITLE`
+or `--collection NAMESPACE/SLUG` names another, and `--collection ""` joins
+none. `--license` is the base model's own, `--repo`
+names a repo other than `USER/<org>-<Model>-hierophant-LoRA-GGUF`, which
+names the base's uploader since an adapter is exact for its files, and `--quant`
 gives the quant when the base file's name does not say it.
 
 llama.cpp has no Hugging Face download for adapters, so users fetch one
@@ -264,18 +338,18 @@ hand:
 
 ```
 # sites that will be ablated, and caveats
-build/bin/hierophant info --hf-repo unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M
-build/bin/hierophant capture --hf-repo unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M \
+./hierophant core info --hf-repo unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M
+./hierophant core capture --hf-repo unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M \
   --harmful data/harmful-train.txt --harmless data/harmless-train.txt -o dirs.gguf
-build/bin/hierophant adapter --hf-repo unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M \
+./hierophant core adapter --hf-repo unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M \
   -d dirs.gguf -o qwen3-4b-abliterated.gguf --direction-index 20
-scripts/hierophant_eval.py --hf-repo unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M \
+./hierophant eval unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M \
   --lora qwen3-4b-abliterated.gguf --scales 0.5,1,1.25,1.5
 ```
 
 the prompt sets are not in the repo. `make datasets` fetches them from the
 huggingface hub and refuses any whose rows no longer hash as
-`data/manifest.json` pins (`scripts/fetch_datasets.py data --more
+`data/manifest.json` pins (`./hierophant data fetch data --more
 --update` takes the new rows). check their terms before redistributing:
 
 | file | source | license |
@@ -297,7 +371,7 @@ with `-hft`/`--hf-token` or `HF_TOKEN` for gated repos; `--offline` (or
 the eval prints refusal rate and KL divergence at each scale and writes
 `qwen3-4b-abliterated.json` beside the adapter, recording the base SHA-256,
 the recommended scale and the scores. the recommended scale has the fewest
-refusals whose KL stays within `--max-kld` (default 0.1; the `--kld-text`
+refusals whose KL stays within `--max-kld` (default 0.05; the `--kld-text`
 KL when measured, else the first-token KL). repeat `--lora` to score several
 adapters on one server load; an adapter hierophant did not build (a
 published one, as a baseline) is scored the same way but gets no sidecar.
@@ -352,7 +426,7 @@ an adapter is only valid on the base whose SHA-256 its sidecar records.
 - `--residual R.gguf` adds a second direction to each output: R's direction
   at the output's first index, with R captured under an adapter A
   (`capture --lora A`) from the prompts A still refuses
-  (`filter_prompts.py --lora A`). the result is rank 2, aimed at what one
+  (`hierophant data filter --lora A`). the result is rank 2, aimed at what one
   direction leaves behind. the sidecar records it under
   `directions.residual`.
 - `capture --positions N` averages the last N prompt tokens (the chat
@@ -361,15 +435,16 @@ an adapter is only valid on the base whose SHA-256 its sidecar records.
   as well (n_harmless * n_layer * n_embd * 2 bytes).
 - `capture --think` captures with the template's thinking on; models served
   with reasoning may refuse in a different place.
-- `scripts/filter_prompts.py -m model.gguf --harmful data/harmful-train.txt
+- `./hierophant data filter -m model.gguf --harmful data/harmful-train.txt
   --harmless data/harmless-train.txt` keeps only the harmful prompts the base model
   refuses and the harmless ones it answers, judged as the eval judges
   (`--judge`), into `data/*.filtered.txt`; capture from those.
 - `capture --harmful a.txt,b.txt` pools several prompt files, a prompt
-  from each in turn (as every script does); `--limit` caps the total. `scripts/fetch_datasets.py --extra
+  from each in turn (as every command does); `--limit` caps the total.
+  `./hierophant data fetch --extra
   NAME=DATASET:SPLIT:N[:COLUMN[:CONFIG]]` fetches another huggingface
   dataset (a multilingual one, say) into `data/NAME.txt`.
-- `scripts/fetch_datasets.py --more` fetches more harmful prompts for
+- `./hierophant data fetch --more` fetches more harmful prompts for
   scoring: `harmful-jbb` (JailbreakBench) and `harmful-lat` (LLM-LAT),
   without any prompt `harmful-train` or `harmful-test` already has.
 - the directions file depends only on the arch, so a capture on a
@@ -398,7 +473,7 @@ an adapter is only valid on the base whose SHA-256 its sidecar records.
   prompt, the adapter's SHA-256 and scale, and only the options that shape
   it. a rerun after ctrl-c repeats only what was in flight and starts
   llama-server only if something is missing; a changed judge re-judges the
-  kept replies. `filter_prompts.py` keeps one in its `--out-dir`.
+  kept replies. `hierophant data filter` keeps one in its `--out-dir`.
 - every point reports `loops`: the share of replies (reasoning and answer)
   in which some 8-word passage recurs 4 times, a model going round in
   circles rather than deliberating at length.
@@ -419,79 +494,63 @@ an adapter is only valid on the base whose SHA-256 its sidecar records.
   n_vocab * ctx * 2 bytes per chunk.
 - `--at-budget` measures the KL at every scale first and replies only at
   the scale where the larger of the first-token and text KL reaches
-  `--max-kld`; `--no-replies` scores the first token alone. the automated
-  run uses both.
+  `--max-kld`, measured there first and stepped down if it is over;
+  `--no-replies` scores the first token alone. the automated run uses both.
 
-`hierophant kl` also runs on its own:
+`hierophant core kl` also runs on its own:
 
 ```
-build/bin/hierophant kl -m model.gguf --text data/wikitext-test.txt -c 512 --chunks 8 --lora a.gguf --scale 1 --lora a.gguf --scale 1.5
+./hierophant core kl -m model.gguf --text data/wikitext-test.txt -c 512 --chunks 8 --lora a.gguf --scale 1 --lora a.gguf --scale 1.5
 ```
 
 it prints one JSON line per run: `{"lora": "a.gguf", "scale": 1, "kld": 0.072, "same_top": 0.79}`.
 
-## pipeline
+## runs
 
-`scripts/hierophant_pipeline.py` runs the whole recipe for one model into
-one output directory: filter the training prompts, capture, split at each
-direction index, search, build the winner, confirm it on prompts the search
-never saw (JailbreakBench and LLM-LAT, with full-sequence KL over WikiText),
-which picks its scale under `--confirm-max-kld` and writes its sidecar, and
-check it with thinking on at that scale (`--think-scales` to override). the
-summary marks each adapter's picked scale with `*` and shows the thinking
-check's refusals, unfinished replies and loops beside it.
+`./hierophant build MODEL` is the only flow. it decides what to do from the
+model's config and says so on its first line:
 
-```
-scripts/hierophant_pipeline.py -ngl 99 --hf-repo unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS \
-  --name q38-v2 --indices 32,33,34 --uniform --trials 18 --startup 9 --ref q38-33p.gguf
-```
+- no accepted recipe: it searches, and a search that converges fills the
+  config. a search stopped early (ctrl-c, `--rounds`) changes nothing.
+- an accepted recipe: it builds that one candidate for this quant, with its
+  residual capture and a held-out eval, then records the numbers in the
+  config. an accepted recipe on another quant counts, though whether it
+  carries over is what that eval measures.
+- `--search` searches anyway, and `--recipe L33-pcs8-res` builds any recipe.
+  a search never replaces an accepted recipe: it prints the winner, and
+  `./hierophant accept MODEL [RECIPE]` writes it over. `--no-accept` leaves
+  the config alone.
 
-without `--out`, the run goes into `lora/<org>--<repo>--<quant>` under the
-current directory (here `lora/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS`).
-
-each finished step leaves a marker, so rerunning the same command resumes
-after an interruption; `--from search` (or any step) reruns from there. a
-changed option without `--from` reruns from the first step that reads it
-(`--indices` from split, `--confirm-scales` from confirm), so outputs of
-two configurations never mix. every command's output is also in
-`OUT/logs/<step>.log`, and `OUT/summary.json` puts the winner beside the
-`--ref` adapters (whose sidecars go under `OUT/refs`, not beside the
-originals). `--positions`, `--harmless-pcs`, `--no-filter`,
-`--split-by kind` and `--think-capture` change the direction recipe; run
-each variant into its own `--out` to compare them. the search defaults suit
-Qwen3.8-Flash-Next (edits reach nearly every layer).
-
-- `--screen` compares recipes in a fraction of the time. it skips split and
-  search and builds every `--indices` entry at weight 1 as
-  `OUT/NAME-<index>.gguf`. a uniform weight is the same as a runtime scale,
-  so the sweep over `0.8..1.6` covers what a uniform search would. all of
-  them are scored on 60 JBB + LAT prompts past the 300 a full confirmation
-  uses, with 4 chunks of WikiText KL, then 16 thinking replies of up to 2048
-  tokens each at the picked scale. any of these can still be set.
-- `--residual SCALE` adds `OUT/NAME-res.gguf`: the first built adapter plus
-  the direction of what it still refuses with it applied at SCALE (the
-  scale you would serve it at; 1 for a searched winner, whose weight is
-  built in).
-- `--train-data OTHER/data` reuses another run's filtered training prompts,
-  so a variant skips the filter step.
-- `--targets K,K` limits the edited site kinds, e.g. to leave out
-  `token_embd` and `ple_value`, which touch every generated token.
+without `--out`, a run goes into `out/<org>--<repo>--<quant>` under the
+current directory. `--name RUN` keeps a run apart in `OUT/runs/RUN`, reusing
+`OUT`'s directions, cache and residuals, and any command that reads a run
+takes it too.
 
 ```
-scripts/hierophant_pipeline.py -ngl 99 --hf-repo unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS \
-  --screen --out lora/q38-s-pcs8 --name s --indices 33,32 --harmless-pcs 8 --residual 1.4 \
-  --train-data lora/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/data
+./hierophant compare qwen3.8 --lora other.gguf     # beside the best, on the report's prompts
+./hierophant accept qwen3.8 L31-pcs8-res           # any recipe a report scored
+./hierophant verify qwen3.8                        # rebuild from nothing, beside the recorded scores
+./hierophant serve qwen3.8 -- --port 8080          # the rest goes to llama-server
+./hierophant chat qwen3.8                          # the same adapter in llama-cli
+./hierophant prune qwen3.8                         # list what no round will read; --yes deletes it
 ```
 
-compare screens at equal `kld_seq` rather than at equal scale: a stronger
-direction reaches fewer refusals at a lower scale without being better.
-with 60 prompts, differences under about 0.08 in refusals are noise.
+a finished round's adapters are deleted as it is recorded, since no later
+round reads them and their scores stay in `round.json` and `cache.jsonl`;
+`--keep-rounds` keeps them. `prune` also removes the residuals of candidates
+no run holds, which are captured again if they come back. `verify` works in
+`OUT/runs/verify` with an empty cache, so it measures whether the recipe
+reproduces, including on another machine.
+
+compare runs at an equal KL rather than an equal scale: a stronger direction
+reaches fewer refusals at a lower scale without being better. at 300 prompts,
+differences under about 0.02 in refusals are noise.
 
 ## qwen3.8-flash-next
 
-the best recipe found for UD-IQ4_XS is direction 33 with
-`--harmless-pcs 8` plus `--residual 1.4`, served at scale 1 (the command
-above, `OUT/s-res.gguf`). on the screen slice:
+the best recipe found by hand for UD-IQ4_XS is direction 33 with 8 harmless
+PCs and a residual captured under the adapter at 1.4, served at scale 1.
+on a 60-prompt screen:
 
 | adapter | refusals | first-token KL | WikiText KL |
 |---|---|---|---|
@@ -510,14 +569,14 @@ token budget.
 
 ## search
 
-heretic tunes a weight curve per component. `scripts/hierophant_search.py`
+heretic tunes a weight curve per component. `./hierophant curves`
 does the same without writing a file per trial: llama-server loads the split
 adapters unapplied, and each trial is one set of per-request scales, the
 curves' weights at each layer.
 
 ```
-build/bin/hierophant adapter -m model.gguf -d dirs.gguf --direction-index 33 --split -o parts/s-{}.gguf
-scripts/hierophant_search.py -m model.gguf --split-dir parts --limit 50 --trials 60 --max-kld 0.05 \
+./hierophant core adapter -m model.gguf -d dirs.gguf --direction-index 33 --split -o parts/s-{}.gguf
+./hierophant curves model.gguf --split-dir parts --limit 50 --trials 60 --max-kld 0.05 \
   --results search.json
 ```
 
@@ -547,18 +606,18 @@ moved refusals, so search it with `--distance 0.5,1 --position 0.5,0.9
 
 ## translated prompts
 
-`scripts/translate_prompts.py` translates prompt sets with a model, so
+`./hierophant data translate` translates prompt sets with a model, so
 directions can be captured from several languages and adapters scored in
-them. it starts the pinned llama-server itself, optionally with an
+them. it starts the built llama-server itself, optionally with an
 abliterated adapter, since an aligned model often refuses to translate a
 harmful prompt; `--url URL --url-model NAME` uses a running endpoint.
 
 ```
-scripts/translate_prompts.py -m model.gguf --lora q38-33p.gguf --lora-scale 1.25 -ngl 99 -np 8 \
+./hierophant data translate -m model.gguf --lora q38-33p.gguf --lora-scale 1.25 -ngl 99 -np 8 \
   --languages zh,ru,es,de,ja,ar,hi,sw \
   data/harmful-train.txt data/harmless-train.txt data/harmful-test.txt data/harmless-test.txt
-build/bin/hierophant capture -m model.gguf --harmful data/harmful-train.txt,data/harmful-train.zh.txt,... ...
-scripts/hierophant_eval.py -m model.gguf --lora A.gguf --harmful data/harmful-test.zh.txt \
+./hierophant core capture -m model.gguf --harmful data/harmful-train.txt,data/harmful-train.zh.txt,... ...
+./hierophant eval model.gguf --lora A.gguf --harmful data/harmful-test.zh.txt \
   --harmless data/harmless-test.zh.txt --judge self
 ```
 

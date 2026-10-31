@@ -57,6 +57,15 @@ small r component.
   default the harmless mean's component is projected out first: the raw
   difference also carries part of what every prompt shares, and ablating
   that disturbs harmless replies (KL) without removing more refusal.
+- the `hierophant` script at the top of the repo is the one entrypoint. it
+  maps a command to a script or to `build/bin/hierophant-core` (the C++ tools,
+  through `hierophant core`) and replaces itself with that program, so
+  signals, the terminal and the exit code are the tool's own. it holds no
+  logic of its own beyond naming the model and the flags the configs set
+  (`scripts/hierophant_config.py`), placed first so a command line's win.
+  a model's config is plain data with an allowlist of search keys, because
+  it can come from someone else: a judge url in a shared file could send
+  prompts anywhere. the machine's file and flags hold paths and urls.
 - `--from-adapter` reads each site's direction and weight back from an
   existing rank-1 adapter (B = -w r) and recomputes only A, which is what
   ties an adapter to one base file.
@@ -71,7 +80,7 @@ small r component.
   no file writes or server restarts. it mirrors the C++ curve formula and
   prints the `--curve` flags (in round-trip float form) that rebuild the
   winner exactly.
-- `scripts/hierophant_eval.py` starts the pinned llama-server with
+- `scripts/hierophant_eval.py` starts the built llama-server with
   `--lora-init-without-apply` and sends each request with its own
   `"lora":[{"id":0,"scale":s}]`. the server clears its cache when the LoRA
   set changes. it writes the sidecar. a refusal is judged by heretic's
@@ -110,21 +119,21 @@ small r component.
   refinement most of the time. `--rescore` re-scores the leaders on a
   second slice of prompts, since a minimum over many noisy trials
   overstates the winner.
-- `scripts/hierophant_pipeline.py` only sequences the other tools. its
-  prompt budget: the train split picks directions, harmful/harmless-test
-  0..N tune the search and N..2N re-score its leaders, and the extra sets
-  (JailbreakBench, LLM-LAT, both free of the test and train prompts)
-  confirm, so no stage scores on prompts an earlier one chose with. a step
-  is done when its marker exists; config.json pins what the markers mean,
-  and AFFECTS maps each option to the first step that reads it (unlisted
-  ones to filter), so a change drops only the markers it invalidates.
-  `--screen` scores JBB + LAT from 300 on, past every full confirmation.
-  the thinking check follows the confirmation so it can run each adapter at
-  its picked scale, where it would be served.
-- `scripts/hierophant_auto.py` is the default flow: successive halving over
+- `scripts/hierophant_auto.py` (`hierophant build`) is the one flow: successive halving over
   recipes (index, harmless PCs, residual, weight), then a beam search around
-  the survivors with the index step halving each round,
-  built on the pipeline's `Run`, filter and capture. its design choices:
+  the survivors with the index step halving each round, built on
+  `scripts/hierophant_run.py`'s `Run`, filter and capture. a known recipe is
+  the same round with one candidate. `configs/` is written only by `accept`
+  and by a build filling a blank (a first converged search, or a recipe's
+  numbers for its quant), so an accepted recipe changes by decision alone:
+  top candidates sit within noise, and a rerun swapping one for another on
+  luck would leave a model's quants on different recipes. tomllib cannot
+  write, so `with_quant` replaces a quant's tables as text and a person's
+  comments survive. finished rounds' adapters are deleted when recorded: no
+  round reads another's, scores outlive them in the cache and `round.json`,
+  and an adapter's rebuild is a matter of seconds. `--name` keeps a run in
+  `OUT/runs/NAME`, sharing `OUT`'s directions, cache and residuals, so a
+  second search costs only what differs. its design choices:
   - one capture with `--keep-rows` serves every PC count, and a uniform
     weight equals a runtime scale, so a candidate's sweep over scales is a
     sweep over weights without rebuilding.
@@ -153,7 +162,7 @@ small r component.
     PC counts are screened too because they interact with the layer (on
     qwen3.8 8 PCs helped L33 and hurt L34). the best `--screen-keep` (16
     pairs) are round 1.
-    `--screen-only` reruns the screen in a finished run's directory beside
+    `hierophant screen` reruns the screen in a finished run's directory beside
     its round 1 refusals, which is how the ranking gets checked.
   - selection (JBB + LAT 300..) and promotion (JBB + LAT 0..300, leader beside
     the incumbent on the same prompts) never share prompts, so the
@@ -206,6 +215,18 @@ small r component.
     the same prompts in an earlier run), so its residual, the manual
     recipe, was never built. the margin is one standard error of the cut's
     own rate, not of a difference, so the survivors still halve roughly.
+    near ties can still keep nearly all of them (16 of 17 on lfm3 at 256
+    prompts), and with more than 8 left no residual would join, so the
+    round before the last keeps the best 8 by rank and adds their
+    residuals: every run measures residuals at full prompts, for the same 8
+    captures, and that last round stays at 16 candidates. a residual is
+    captured under the adapter at its weight before the residual joined,
+    and adding it lowers the weight the budget allows, so its first score
+    comes from a capture made too strong (on lfm3, L16-res 0.211 from a
+    capture at 1.03, 0.080 recaptured near 0.74). so one that lands more
+    than `RESIDUAL_REUSE` from its capture is recaptured and scored again in
+    the same round, before it is ranked. that once only: a further drift
+    would chase noise.
   - round 1 has every layer, not a grid: a grid 5 layers apart missed L33
     on qwen3.8 (adjacent layers' directions have a cosine near 0.82), and
     halving does not move layers. moving the leaders' layers while halving
@@ -241,6 +262,18 @@ small r component.
   one direction leaves. `adapter --residual` appends it to each output's
   directions before gram-schmidt, so the rank-2 edit removes both exactly
   and the second column is the part of the residual the first lacks.
+- the KL budget defaults to 0.05. on lfm3 at 0.1, scale 1 had 0.11 refusals
+  against 0.15 at the scale reaching 0.044, on 100 prompts, and a search at
+  0.05 reached 0.080 held out against 0.060 at 0.1: most of the refusals
+  go early, and the rest cost KL quickly. a model's `[search]` can set another.
+- the final check runs at full length, which the report's 64 tokens do not.
+  markers is the report's own measure; the base as judge is broader, and on
+  lfm3 agreed with markers on the base (48 of 50 each) but not the adapter
+  (29 against 3), since it counts the warnings long replies end with. a long
+  reply reaches the judge as its opening and ending (`ends_of`): whole, it
+  overflows a slot's context and the server answers 400. loops only show at
+  full length, and on lfm3 they rose with scale on harmful prompts (0.10 at
+  0.6, 0.25 at 1) and stayed at the base's rate on harmless ones.
 - the scale in a sidecar is the fewest refusals within a KL budget, on the
   full-sequence KL when measured: refusal rates flatten while KL keeps
   climbing, and the least-refusing scale alone picked q38-v2 at 2.6x its
@@ -251,7 +284,7 @@ small r component.
   carries a refusal marker its source lacks. each output names its source
   in the manifest and inherits its split, so `describe_set` reports it as
   that dataset and split plus a language.
-- `--kld-text` hands full-sequence KL to `hierophant kl` (`src/kl.cpp`),
+- `--kld-text` hands full-sequence KL to `hierophant-core kl` (`src/kl.cpp`),
   which measures what `llama-perplexity --kl-divergence` does (the second
   half of each chunk, base tokens below log-probability -16 left out) for
   every uncached adapter and scale from one model load. llama-perplexity
@@ -270,19 +303,25 @@ small r component.
 - `--at-budget` measures before it generates: the first-token KL at every
   scale and the KL over the text, then `budget_scale` (where the larger of
   the two first reaches `--max-kld`, interpolated, rounded so that a rerun
-  asks for the same scale), then the rest of `score` there alone. a ranking
-  at the budget reads that one point, so a wide sweep of 6 scales replies
-  once instead of 6 times. the server is stopped for each KL run and
+  asks for the same scale), then the KL measured at that scale and stepped
+  down (`next_scale`, at most 3 tries) until it is within, then the rest of
+  `score` there alone. a ranking at the budget reads that one point, so a
+  wide sweep of 6 scales replies once instead of 6 times. the prediction
+  must be measured: a point over the budget left a ranking only the line
+  from the base's own refusals, so on qwen3.8 L33 with 8 PCs measured 0.102
+  at KL 0.107, ranked 0.163 and was cut from a tie for first. a candidate
+  now only reaches the ranking on a point measured within the budget. the
+  server is stopped for each KL run and
   started again after. `--logp-tokens 0` drops reply_logp (a request per
   token, the slowest stage) and `--no-replies` drops the replies, for a
   screen on one-token requests alone.
 - `--progress` bars (`scripts/progress.py`, `progress` in `src/util.h`, one
   format) end each redraw in a carriage return and the finished bar in a
-  newline. the pipeline's `Run.sh` reads its children's output as bytes and
+  newline. `Run.sh` reads its children's output as bytes and
   cuts it after either, so it draws redraws in place and logs only lines;
   text-mode pipes would turn every redraw into a line. the eval counts a
   request when it finishes rather than in order, and a KL chunk from the
-  bar `hierophant kl` draws, reading only its latest line: matching the
+  bar `hierophant-core kl` draws, reading only its latest line: matching the
   whole of its log at every read was quadratic, fell behind the child,
   and the full pipe stopped both. a `Run` may hold a bar over
   several commands (auto: a round's builds): the children's bars named in
@@ -313,6 +352,9 @@ small r component.
   once on a second, so it gets that second one after 2 s. waiting out the
   first took the whole 30 s, the same 30 the automated run gives the eval,
   which it could kill before the eval killed its server.
+- `scripts/hierophant_preview.py` renders a staged card to one HTML file
+  beside the staging directory, so `hf upload` leaves it out. it handles only
+  the markdown the card uses, to stay on the standard library.
 - `scripts/hierophant_publish.py` stages, and with `--upload` uploads, one
   Hugging Face repo per model holding one adapter per base quant, since an
   adapter is exact only for the file its factors came from (R2). the model
@@ -341,10 +383,15 @@ first-token KL and of reply_logp rather than given a guessed distribution.
 ## build
 
 cmake fetches llama.cpp at the pinned commit (or uses
-`FETCHCONTENT_SOURCE_DIR_LLAMA_CPP`), builds `hierophant` against `llama`,
-`llama-common` and `ggml`, and builds `llama-server` and `llama-perplexity`
-(which the tests check `hierophant kl` against) from the same tree, so
-validation runs on the build that wrote the adapter.
+`FETCHCONTENT_SOURCE_DIR_LLAMA_CPP`), builds `hierophant-core` against
+`llama`, `llama-common` and `ggml`, and builds `llama-server`, `llama-cli` and
+`llama-perplexity` (which the tests check `hierophant-core kl` against) from
+the same tree, so
+validation runs on the build that wrote the adapter. the commit in
+`CMakeLists.txt` is what a fresh checkout fetches and the tests run on; a
+long run can sit on a local tree that moves, so a mismatch only warns, and
+each adapter records its commit in the sidecar, the config, `best.txt` and
+the card.
 HTTPS comes from llama.cpp's pinned boringssl (`LLAMA_BUILD_BORINGSSL`)
 rather than the host's openssl, so the build needs no SSL dev package and
 links the same library everywhere.

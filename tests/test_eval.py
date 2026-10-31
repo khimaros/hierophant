@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 
 from common import (
     FOREIGN_LORA,
@@ -508,20 +509,19 @@ class Modes(unittest.TestCase):
         self.assertNotIn("reply logp", p.stdout)
         self.assertTrue(all("reply_logp" not in r and "refusals" in r for r in points))
 
-    def test_at_budget_replies_only_where_the_kl_reaches_it(self):
-        from hierophant_eval import budget_scale
+    def test_at_budget_replies_only_where_the_kl_was_measured_within_it(self):
+        from hierophant_eval import kl_of, within_budget
 
         p, points = self.eval("budget", "--scales", "0.5,1,2", "--at-budget", "--max-kld", "0.05")
         swept = [r for r in points if r["scale"] in (0.5, 1, 2)]
         self.assertEqual(len(swept), 3)
-        self.assertTrue(all("kld" in r and "kld_seq" in r for r in swept))
+        self.assertTrue(all("kld" in r and "kld_seq" in r for r in points))
         replied = [r["scale"] for r in points if "refusals" in r]
-        at = budget_scale(swept + [r for r in points if r["scale"] == 0], 0.05)
+        at = within_budget(points, 0.05)
         self.assertEqual(replied, [0, at])
         self.assertTrue(0 < at < 2, points)
-        # measured there too, not interpolated
-        point = next(r for r in points if r["scale"] == at)
-        self.assertIn("kld_seq", point)
+        # measured there before a reply was generated, not interpolated
+        self.assertLessEqual(kl_of(next(r for r in points if r["scale"] == at)), 0.05)
         self.assertEqual(p.stdout.count(" replies: 3/3"), 2)
 
     def test_no_replies_keeps_the_first_token_scores(self):
@@ -583,6 +583,73 @@ class BudgetScale(unittest.TestCase):
 
     def test_it_is_rounded_so_a_rerun_asks_for_the_same_scale(self):
         self.assertEqual(self.at([kl_point(0, 0), kl_point(1, 0.3)], 0.1), 0.33)
+
+
+class LongReplyJudge(unittest.TestCase):
+    """a 4096-token reply plus the judge's own prompt overflows a slot's 4096-token context,
+    and the server answers 400, which ended lfm3's final check after every reply was in."""
+
+    def judged(self, reply):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from hierophant_eval import Judge
+
+        seen = []
+
+        class Server:
+            def chat(self, messages, loras, **extra):
+                seen.append(messages[0]["content"])
+                return {"message": {"content": "no"}}
+
+        Judge(SimpleNamespace(judge="self", judge_model=""), Server())("prompt", reply)
+        return seen[0]
+
+    def test_a_long_reply_reaches_the_judge_as_its_opening_and_ending(self):
+        got = self.judged("I will not do that. " + "x " * 20000 + "and that is final.")
+        self.assertLess(len(got), 6000)
+        self.assertIn("I will not do that.", got)
+        self.assertIn("and that is final.", got)
+
+    def test_a_short_reply_reaches_it_whole(self):
+        self.assertIn("a short reply", self.judged("a short reply"))
+        self.assertNotIn("omitted", self.judged("a short reply"))
+
+
+class BudgetCorrection(unittest.TestCase):
+    """the kl at a predicted scale can pass the budget: on qwen3.8, L33-pcs8 reached 0.107 at
+    1.02, and interpolating from the base turned its 0.102 refusals into 0.163, which cut it.
+    so the scale is measured before any reply, and stepped down until it is within."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from hierophant_eval import next_scale, within_budget
+
+        cls.next = staticmethod(next_scale)
+        cls.within = staticmethod(within_budget)
+
+    def test_a_prediction_measured_over_is_replaced_by_one_below_it(self):
+        points = [kl_point(0, 0), kl_point(1, 0.09), kl_point(1.02, 0.107), kl_point(1.15, 0.2)]
+        self.assertEqual(self.next(points, 0.1), 1.01)
+
+    def test_an_unmeasured_prediction_is_tried(self):
+        self.assertEqual(self.next([kl_point(0, 0), kl_point(1, 0.05), kl_point(2, 0.15)], 0.1), 1.5)
+
+    def test_a_prediction_measured_within_is_settled(self):
+        points = [kl_point(0, 0), kl_point(1, 0.09), kl_point(1.02, 0.098), kl_point(1.03, 0.11)]
+        self.assertIsNone(self.next(points, 0.1))
+
+    def test_rounding_onto_a_scale_measured_over_steps_below_it(self):
+        self.assertEqual(self.next([kl_point(0, 0), kl_point(1.5, 0.1001)], 0.1), 1.49)
+
+    def test_an_adapter_within_the_budget_everywhere_needs_nothing_more(self):
+        self.assertIsNone(self.next([kl_point(0, 0), kl_point(1, 0.01), kl_point(2, 0.02)], 0.1))
+
+    def test_the_answer_is_the_largest_scale_measured_within_before_the_first_crossing(self):
+        points = [kl_point(0, 0), kl_point(1, 0.09), kl_point(1.01, 0.099), kl_point(1.02, 0.107), kl_point(2, 0.05)]
+        self.assertEqual(self.within(points, 0.1), 1.01)
+
+    def test_nothing_within_the_budget_answers_zero(self):
+        self.assertEqual(self.within([kl_point(0, 0), kl_point(0.5, 0.2)], 0.1), 0)
 
 
 class Loops(unittest.TestCase):

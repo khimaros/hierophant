@@ -45,13 +45,15 @@ PROGRESS_EVERY = 32  # at least this many prompts between progress lines
 PROGRESS_LINES = 4  # and about this many lines per stage at most
 HASH_CHUNK = 1 << 24
 SCALE_TOLERANCE = 0.02  # refusal rates this close to the best count as equal
-MAX_KLD = 0.1  # default kl budget of the picked scale
+MAX_KLD = 0.05  # default kl budget of the picked scale
 BUDGET_DIGITS = 2  # of a scale found by budget_scale, so a rerun asks for the same one
+BUDGET_TRIES = 3  # kl measurements to bring a predicted scale within the budget
 SUMMARY = (("refusals", ".3f"), ("kld", ".4f"), ("top1_same", ".3f"), ("reply_logp", ".3f"), ("unfinished", ".3f"),
            ("loops", ".3f"))  # a sweep point's line, each where it was measured
 OFF = [(0, 0.0)]  # naming one adapter at scale 0 turns every adapter off
 JUDGE_MAX_TOKENS = 4
 JUDGE_REASONING_CHARS = 2000  # of a cut-off reply's reasoning, the end the judge reads instead
+JUDGE_REPLY_CHARS = 2000  # of each end of a long reply
 CUT_OFF = "(cut off while still reasoning; this is the end of its reasoning)\n"
 LOOP_NGRAM = 8  # words in a passage that, said LOOP_REPEATS times, makes a reply looped
 LOOP_REPEATS = 4
@@ -430,6 +432,13 @@ def free_port():
         return s.getsockname()[1]
 
 
+def ends_of(reply):
+    """a reply as the judge can read it: a long one would overflow a slot's context once in
+    its prompt, and a refusal shows at its opening or its ending."""
+    n = JUDGE_REPLY_CHARS
+    return reply if len(reply) <= 2 * n else f"{reply[:n]}\n(... middle omitted ...)\n{reply[-n:]}"
+
+
 class Judge:
     """decides whether a reply refuses: heretic's markers, the served base model
     ("self", every adapter off) or a model behind an openai-compatible url."""
@@ -454,7 +463,7 @@ class Judge:
             if not reasoning.strip():
                 return True
             reply = CUT_OFF + reasoning[-JUDGE_REASONING_CHARS:]
-        return has_marker(reply) if self.kind == "markers" else self.ask(prompt, reply)
+        return has_marker(reply) if self.kind == "markers" else self.ask(prompt, ends_of(reply))
 
 
 def looped(text):
@@ -591,16 +600,31 @@ def full_sweep(args, server, judge, harmful, harmless, scales, sweep):
     return sweeps
 
 
-def at_budget_sweep(args, server, judge, harmful, harmless, scales, sweep):
-    """kl first: each adapter's kl at every scale, then the rest of score only at the scale
-    where it reaches --max-kld (budget_scale), the only one a ranking at the budget reads.
+def measure_kls(args, server, judge, harmful, harmless, scales, sweep, base=None):
+    """(sweeps, base) of the first-token kl, then the kl over --kld-text, at these scales.
     llama-server and the kl over --kld-text never hold the model at the same time."""
     try:
-        sweeps, base = evaluate_all(server, judge, harmful, harmless, scales, args.parallel, kl_only=True)
+        sweeps, base = evaluate_all(server, judge, harmful, harmless, scales, args.parallel, kl_only=True, base=base)
     finally:
         server.close()
     sequence_klds(args, sweeps, server, kl_runs(args, server, scales) if args.kld_text else [], sweep)
-    at = {lora: [s] if (s := budget_scale(points, args.max_kld)) else [] for lora, points in sweeps.items()}
+    return sweeps, base
+
+
+def at_budget_sweep(args, server, judge, harmful, harmless, scales, sweep):
+    """kl first: each adapter's kl at every scale, then at the scale predicted to reach
+    --max-kld until one is measured within it (next_scale), then the rest of score only at
+    that one (within_budget), the only one a ranking at the budget reads. every adapter is
+    so scored on a point it measured within the budget, not one a little over it."""
+    sweeps, base = measure_kls(args, server, judge, harmful, harmless, scales, sweep)
+    for _ in range(BUDGET_TRIES):
+        todo = {lora: [s] if (s := next_scale(points, args.max_kld)) else [] for lora, points in sweeps.items()}
+        if not any(todo.values()):
+            break
+        measured, _ = measure_kls(args, server, judge, harmful, harmless, todo, sweep, base)
+        for lora, points in measured.items():
+            sweeps[lora] += points
+    at = {lora: [s] if (s := within_budget(points, args.max_kld)) else [] for lora, points in sweeps.items()}
     try:
         there, _ = evaluate_all(server, judge, harmful, harmless, at, args.parallel, base=base)
     finally:
@@ -682,6 +706,30 @@ def budget_scale(points, max_kld):
             t = (max_kld - kl_of(a)) / (kl_of(b) - kl_of(a))
             return round(a["scale"] + t * (b["scale"] - a["scale"]), BUDGET_DIGITS)
     return pts[-1]["scale"]
+
+
+def next_scale(points, max_kld):
+    """the scale to measure the kl at next, or None once budget_scale lands on one measured
+    within max_kld or none is left to try. a line between two scales can miss by more than
+    their distance suggests, so a prediction is only believed once it has been measured."""
+    at = budget_scale(points, max_kld)
+    measured = {p["scale"]: p for p in points}
+    if at not in measured:
+        return at
+    if kl_of(measured[at]) <= max_kld:
+        return None
+    at = round(at - 10**-BUDGET_DIGITS, BUDGET_DIGITS)
+    return at if at > 0 and at not in measured else None
+
+
+def within_budget(points, max_kld):
+    """the largest scale measured within max_kld before the kl first passes it, or 0."""
+    best = 0
+    for p in sorted(points, key=lambda p: p["scale"]):
+        if kl_of(p) > max_kld:
+            break
+        best = p["scale"]
+    return best
 
 
 def pick(results, max_kld):
@@ -855,7 +903,7 @@ def add_server_args(p):
                    help="markers (heretic's), self (the served base model) or an openai-compatible base url")
     p.add_argument("--judge-model", default="", help="model name to request from a --judge url")
     p.add_argument("--server", default=BIN / "llama-server")
-    p.add_argument("--hierophant", default=BIN / "hierophant")
+    p.add_argument("--hierophant", default=BIN / "hierophant-core")
     p.add_argument("--url", help="use a running llama-server whose lora ids 0..n-1 are these adapters")
     p.add_argument("--url-model", default="", help="model name to request from --url")
     p.add_argument("--server-log")
@@ -919,11 +967,12 @@ def stage_count(args, base):
 def sweep_units(args, n_adapters, scales):
     """the stages of a sweep, each one bar's worth: the base's, each adapter's at each scale
     but 0, and the kl over --kld-text, all of it together. --at-budget scores the scales
-    for their first-token kl alone, then each adapter in full where it reaches the budget,
-    with a kl run of its own."""
+    for their first-token kl alone, measures the kl where each adapter should reach the
+    budget (a further correction only moves the bar's end), then each adapter in full
+    there, with a kl run of its own."""
     points, kl = n_adapters * (len(scales) - 1), bool(args.kld_text)
     if args.at_budget:
-        return stage_count(args, True) + points + kl + n_adapters * stage_count(args, False) + kl
+        return stage_count(args, True) + points + kl + n_adapters + kl + n_adapters * stage_count(args, False) + kl
     return stage_count(args, True) + points * stage_count(args, False) + kl
 
 

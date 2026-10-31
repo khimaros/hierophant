@@ -1,0 +1,8 @@
+[model]
+name = "Qwen3.8-Flash-Next"
+repo = "unsloth/Qwen3.8-Flash-Next-GGUF"
+license = "qwen-community-1.0" # restricted in aimbot's registry: read its terms before publishing
+
+[quant.UD-IQ4_XS]
+file = "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
+sha256 = "5ce89370720f8bf90890f439361282104c1aa1482d4013bb9a50923e758e71a4"

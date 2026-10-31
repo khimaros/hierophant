@@ -9,7 +9,7 @@ int cmd_capture(int argc, char ** argv);
 int cmd_adapter(int argc, char ** argv);
 int cmd_kl(int argc, char ** argv);
 
-static const char * USAGE = R"(usage: hierophant <command> [options]
+static const char * USAGE = R"(usage: hierophant-core <command> [options]
 
 commands:
   info     MODEL [--targets K,K]

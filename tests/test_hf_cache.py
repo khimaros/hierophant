@@ -76,12 +76,12 @@ class HfRepo(unittest.TestCase):
 
     def test_the_scripts_take_a_quant_tag(self):
         sys.path.insert(0, str(ROOT / "scripts"))
+        import hierophant_auto
         import hierophant_eval
-        import hierophant_pipeline
 
         args = hierophant_eval.parse_args(["--hf-repo", f"{REPO}:Q8_0", "--offline", "--lora", "x.gguf"])
         self.assertEqual(args.model, str(self.snap / "stories-Q8_0.gguf"))
-        r = hierophant_pipeline.Run(hierophant_pipeline.parse_args(
+        r = hierophant_auto.Auto(hierophant_auto.parse_args(
             ["--hf-repo", f"{REPO}:Q8_0", "--offline", "--out", str(tmpdir(self.addCleanup)), "--indices", "1"]))
         self.assertEqual(r.model, ["--hf-repo", f"{REPO}:Q8_0", "--offline"])
 

@@ -17,16 +17,35 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hierophant_config import built_recipe, recipe_name
 from hierophant_eval import entry
+from hierophant_preview import write_preview
 
 GITHUB = "https://github.com/khimaros/hierophant"
 HUB = "https://huggingface.co"
 NAME_TAG = "-hierophant-"  # <Model>-hierophant-<QUANT>.gguf: the quant last, as GGUF files end
-REPO_SUFFIX = "-hierophant-LoRA-GGUF"  # <user>/<Model>-hierophant-LoRA-GGUF
+REPO_SUFFIX = "-hierophant-LoRA-GGUF"  # <user>/<org>-<Model>-hierophant-LoRA-GGUF
 GGUF_SUFFIX = re.compile(r"-gguf$", re.IGNORECASE)  # a quant repo's name: <Model>-GGUF
 SHARD = re.compile(r"-\d{5}-of-\d{5}$")  # a split file's shard: -00001-of-00003
 TAGS = ("gguf", "lora", "llama.cpp", "hierophant", "abliteration")
-STAGE = Path("lora") / "publish"  # under the current directory, one subdirectory per repo
+STAGE = Path("out") / "publish"  # under the current directory, one subdirectory per repo
+COLLECTION = "hierophant"  # the hub collection every uploaded repo joins
+# at most 150 characters; the hub only reads it when the collection is first created
+COLLECTION_ABOUT = "abliteration LoRA adapters for GGUF models"
+TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+CARD = TEMPLATES / "model-card.md"  # {placeholders} filled in by card
+BANNER = TEMPLATES / "hierophant-banner.jpeg"  # staged beside each card
+HUB_LICENSES = ("apache-2.0", "mit", "bsd-2-clause", "bsd-3-clause", "cc-by-4.0", "gpl-3.0")  # those models here use
+SHA_CHARS = 12  # of the base's SHA-256 in the card's table; its sidecar has all of it
+COMMIT_CHARS = 9  # of the llama.cpp commit there, as git abbreviates it
+LADDER = "ladder-"  # ladder-<QUANT>.json: every recipe a quant's search tried, kept apart from the sidecars
+LADDER_HEAD = "| recipe | last round | prompts | refusals | weight | KL |\n|---|---|---|---|---|---|"
+LADDER_INTRO = """## every recipe tried
+
+each recipe at the last round it reached, furthest first. these are the search's selection
+scores, not held out: a round's leader is flattered by being picked on those same prompts,
+and recipes that stopped early were scored on fewer of them. only the table above is
+held-out."""
 
 
 def names_of(base, quant=""):
@@ -39,6 +58,12 @@ def names_of(base, quant=""):
             sys.exit(f"error: cannot tell the quant of {base['file']} from {base['repo']}; give --quant")
         quant = stem[len(model) + 1:]
     return model, quant
+
+
+def repo_of(user, base_repo, model):
+    """the hub repo of a base's adapters. it names the base's uploader, as a config's name
+    does, since an adapter is exact for one uploader's files; the hub forbids "--"."""
+    return f"{user}/{base_repo.partition('/')[0]}-{model}{REPO_SUFFIX}"
 
 
 def staged(out, model):
@@ -82,8 +107,11 @@ def scores_at(s):
 def row_of(quant, stem, s):
     r, at = s["eval"]["refusals"], scores_at(s)
     seq = f"{at['kld_seq']:.3f}" if "kld_seq" in at else "-"
-    return (f"| {quant} | {stem}.gguf | {s['base']['sha256']} | {served(s):g} | {recipe_of(s['directions'])} "
-            f"| {r['base']:.2f} -> {at['refusals']:.2f} (n={r['n']}) | {at['kld']:.3f} | {seq} |")
+    final = s["eval"].get("final")
+    loops = f"{final['loops']:.2f} (n={final['n']})" if final else "-"
+    return (f"| {quant} | {stem}.gguf | {s['base']['sha256'][:SHA_CHARS]} | {s.get('llama_cpp', '-')[:COMMIT_CHARS]} "
+            f"| {served(s):g} | {recipe_of(s['directions'])} "
+            f"| {r['base']:.2f} -> {at['refusals']:.2f} (n={r['n']}) | {at['kld']:.3f} | {seq} | {loops} |")
 
 
 def usage_of(repo, base_repo, entries):
@@ -94,65 +122,51 @@ def usage_of(repo, base_repo, entries):
     return "\n".join(lines).rstrip()
 
 
-def card(repo, base_repo, license, entries):
+def round_of(path):
+    return int(path.parent.name.removeprefix("round-"))
+
+
+def ladder_of(run):
+    """every candidate of a run's rounds at the last round it reached, furthest first and
+    best first within a round."""
+    last = {}
+    for path in sorted(run.glob("round-*/round.json"), key=round_of):
+        r = json.loads(path.read_text())
+        for x in r["candidates"]:
+            name = recipe_name(x["cand"])
+            last[name] = {"recipe": name, "round": round_of(path), "prompts": r["n"], "refusals": x["refusals"],
+                          "weight": x["cand"]["weight"], "kl": x["kl"]}
+    return sorted(last.values(), key=lambda x: (-x["round"], x["refusals"], x["kl"]))
+
+
+def ladder_section(out):
+    """every recipe tried, one collapsed table per staged quant, for the end of the card."""
+    tables = []
+    for path in sorted(out.glob(f"{LADDER}*.json")):
+        ladder = json.loads(path.read_text())
+        rows = "\n".join(f"| {x['recipe']}{' (published)' if x['published'] else ''} | {x['round']} | {x['prompts']} "
+                         f"| {x['refusals']:.3f} | {x['weight']:g} | {x['kl']:.3f} |" for x in ladder)
+        quant = path.stem.removeprefix(LADDER)
+        tables.append(f"<details><summary>{quant}: {len(ladder)} recipes</summary>\n\n{LADDER_HEAD}\n{rows}\n\n</details>")
+    return "\n\n".join([LADDER_INTRO, *tables]) + "\n" if tables else ""
+
+
+def license_lines(license, base_repo):
+    """the card's license metadata: the hub's field only takes its own identifiers, so a
+    model's own license is "other", by name, linking to the base that carries its text."""
+    if license in HUB_LICENSES:
+        return f"license: {license}"
+    return f"license: other\nlicense_name: {license}\nlicense_link: {HUB}/{base_repo}"
+
+
+def card(repo, base_repo, license, entries, ladder=""):
     """the repo's README.md: hub metadata, how to use each adapter, its scores and how it was made."""
-    model = repo.split("/")[-1].removesuffix(REPO_SUFFIX)
-    tags = "\n".join(f"- {t}" for t in TAGS)
-    rows = "\n".join(row_of(*x) for x in entries)
-    return f"""---
-base_model: {base_repo}
-base_model_relation: adapter
-license: {license}
-tags:
-{tags}
----
-
-# {model} hierophant LoRA
-
-refusal-removal (abliteration) LoRA adapters for [{base_repo}]({HUB}/{base_repo}), one per
-quant, made with [hierophant]({GITHUB}). each is a small file loaded beside the base model,
-not a second copy of its weights.
-
-## use
-
-pick the adapter for the quant you serve: an adapter is exact only for the base file it
-was built from.
-
-```
-{usage_of(repo, base_repo, entries)}
-```
-
-a lower scale (e.g. `:0.8`) keeps the model closer to the base; `:0` turns it off.
-llama-server can also load an adapter without applying it (`--lora-init-without-apply`)
-and apply it per request, so one server answers both ways.
-
-## adapters
-
-| quant | adapter | base file SHA-256 | scale | recipe | refusals (base -> adapted) | first-token KL | WikiText KL |
-|---|---|---|---|---|---|---|---|
-{rows}
-
-refusals are counted with thinking off on held-out prompts the recipe was not chosen
-on; each adapter's JSON sidecar names them, the judge and every setting. KL is measured
-against the base at the scale given.
-
-## approach
-
-hierophant runs harmful and harmless prompts through the quantized model itself and
-takes the difference of their mean residual streams at the first generated token as the
-refusal direction. the adapter removes that direction from every matrix that writes into
-the residual stream, computed from that quant's own dequantized weights, so at scale 1
-the edit is exact for that file. which layer's direction, how strongly, and whether to
-keep it clear of the harmless prompts' principal components or add a second, residual
-direction were chosen by an automated search, ranked by refusals on prompts it was not
-tuned on at a fixed KL budget. see [hierophant]({GITHUB}) for the method and the tools.
-
-## limitations
-
-- only the listed base files: on another quant the edit is approximate and unmeasured.
-- with thinking on, replies can reason at length before answering; serve with a generous
-  token budget.
-"""
+    model = GGUF_SUFFIX.sub("", base_repo.split("/")[-1])
+    return CARD.read_text().format(
+        model=model, base_repo=base_repo, license=license_lines(license, base_repo), hub=HUB, github=GITHUB,
+        banner=BANNER.name,
+        tags="\n".join(f"- {t}" for t in TAGS), rows="\n".join(row_of(*x) for x in entries),
+        usage=usage_of(repo, base_repo, entries), ladder=ladder)
 
 
 def stage(a):
@@ -165,12 +179,17 @@ def stage(a):
         if model and (this_model, side["base"]["repo"]) != (model, base_repo):
             sys.exit(f"error: {lora} is for {side['base']['repo']}, not {base_repo}; publish it on its own")
         model, base_repo = this_model, side["base"]["repo"]
-        repo = a.repo or f"{a.user}/{model}{REPO_SUFFIX}"
+        repo = a.repo or repo_of(a.user, base_repo, model)
         out = Path(a.out) if a.out else STAGE / repo.split("/")[-1]
         out.mkdir(parents=True, exist_ok=True)
+        shutil.copy(BANNER, out / BANNER.name)
         stem = f"{model}{NAME_TAG}{quant}"
         shutil.copy(lora, out / f"{stem}.gguf")
         shutil.copy(lora.with_suffix(".json"), out / f"{stem}.json")
+        published = built_recipe(side["directions"])
+        ladder = [{**x, "published": x["recipe"] == published} for x in ladder_of(lora.parent)]
+        if ladder:
+            (out / f"{LADDER}{quant}.json").write_text(json.dumps(ladder, indent=2) + "\n")
         print(f"staged {out / stem}.gguf", flush=True)
     return repo, base_repo, out, model
 
@@ -180,20 +199,39 @@ def parse_args(argv):
     p.add_argument("adapters", nargs="+", help="adapter .gguf files, each with its sidecar .json beside it")
     p.add_argument("--license", required=True, help="the base model's license, as its own card names it")
     who = p.add_mutually_exclusive_group(required=True)
-    who.add_argument("--user", help=f"hub user or org: the repo is USER/<Model>{REPO_SUFFIX}")
+    who.add_argument("--user", help=f"hub user or org: the repo is USER/<org>-<Model>{REPO_SUFFIX}")
     who.add_argument("--repo", help="the hub repo, instead of one named after the model")
     p.add_argument("--quant", default="", help="the base quant, when its file name does not say it")
     p.add_argument("--out", help=f"staging directory (default {STAGE}/<repo name>)")
     p.add_argument("--upload", action="store_true", help="upload the staging directory with hf upload")
+    p.add_argument("--collection", default=COLLECTION,
+                   help="the hub collection an upload joins: a title in the repo's namespace, created if "
+                        "missing, or a NAMESPACE/SLUG; empty for none")
     p.add_argument("--hf", default="hf", help="the huggingface hub cli")
     return p.parse_args(argv)
+
+
+def collect(a, repo):
+    """add an uploaded repo to its collection, creating the collection the first time."""
+    slug = a.collection
+    if "/" not in slug:
+        made = [str(a.hf), "collections", "create", slug, "--namespace", repo.partition("/")[0],
+                "--description", COLLECTION_ABOUT, "--exists-ok", "--format", "quiet"]
+        p = subprocess.run(made, stdout=subprocess.PIPE, text=True, check=False)
+        if p.returncode != 0:
+            sys.exit(f"error: {shlex.join(made)} failed; the upload itself succeeded")
+        slug = p.stdout.strip()
+    add = [str(a.hf), "collections", "add-item", slug, repo, "model", "--exists-ok"]
+    if subprocess.run(add, check=False).returncode != 0:
+        sys.exit(f"error: {shlex.join(add)} failed; the upload itself succeeded")
+    print(f"in collection {HUB}/collections/{slug}")
 
 
 def main(argv):
     a = parse_args(argv)
     repo, base_repo, out, model = stage(a)
-    (out / "README.md").write_text(card(repo, base_repo, a.license, staged(out, model)))
-    print(f"wrote {out / 'README.md'}", flush=True)
+    (out / "README.md").write_text(card(repo, base_repo, a.license, staged(out, model), ladder_section(out)))
+    print(f"wrote {out / 'README.md'}\npreview: {write_preview(repo, out)}", flush=True)
     cmd = [str(a.hf), "upload", repo, str(out), ".", "--repo-type", "model"]
     if not a.upload:
         print(f"to publish: {shlex.join(cmd)}")
@@ -201,6 +239,8 @@ def main(argv):
     if subprocess.run(cmd, check=False).returncode != 0:
         sys.exit(f"error: {shlex.join(cmd)} failed")
     print(f"published {HUB}/{repo}")
+    if a.collection:
+        collect(a, repo)
 
 
 if __name__ == "__main__":

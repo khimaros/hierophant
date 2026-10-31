@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""one command in front of the scripts and the C++ tools: it replaces itself with the
+tool, so signals, the terminal and the exit code stay that tool's own."""
+
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+SCRIPTS = ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+from hierophant_config import (
+    ConfigError,
+    config_of_repo,
+    find_config,
+    init,
+    load_configs,
+    load_machine,
+    machine_flags,
+    publish_args,
+    recipe_args,
+    resolve,
+    run_best,
+    search_flags,
+    summary,
+)
+
+CORE = ROOT / "build" / "bin" / "hierophant-core"
+AUTO, EVAL = "hierophant_auto.py", "hierophant_eval.py"
+USAGE = """usage: hierophant <command> [MODEL] [--quant Q] [options]
+
+MODEL is any unique part of a name in configs/, a .gguf file or REPO[:QUANT];
+-m and --hf-repo work as well. --quant is needed where a config has several.
+each command's --help lists its options.
+
+  init REPO         write configs/<org>--<repo>.toml
+  build MODEL       the adapter for a quant: follows the accepted recipe, or
+                    searches if there is none; --search searches regardless,
+                    --recipe L33-pcs8 builds that one, --name keeps a run apart
+  status [MODEL]    the best so far and each round's; alone, every config
+  screen MODEL      the first-token screen alone, beside round 1's scores
+  eval MODEL        score adapters: refusals, KL and the sidecar
+  compare MODEL     score each --lora beside the best on the report's prompts
+  accept MODEL [RECIPE]
+                    write the best, or RECIPE, into the model's config
+  verify MODEL      rebuild the accepted recipe from nothing, beside its scores
+  serve MODEL [-- ARGS]
+                    llama-server with the best at its scale
+  chat MODEL [-- ARGS]
+                    llama-cli with the best at its scale
+  publish MODEL     stage every accepted adapter, or one with :QUANT, and
+                    --upload sends them; REPO:QUANT with no config and ADAPTER
+                    files take --license and --user
+  prune MODEL       list what no round will read again; --yes deletes it
+  curves MODEL      search weight curves over --split-dir adapters
+  config MODEL      the flags build gets from the configs
+  data fetch        fetch the prompt sets
+  data models       fetch the tiny test models
+  data filter       keep the prompts a model refuses
+  data translate    translate prompt sets with a model
+  core COMMAND      the C++ tools: info, capture, adapter, kl, resolve, version
+"""
+# each command's script, the flags it always gets, and whether it takes a MODEL first
+COMMANDS = {
+    "build": (AUTO, (), True),
+    "status": (AUTO, ("--status",), True),
+    "screen": (AUTO, ("--screen-only",), True),
+    "compare": (AUTO, ("--compare",), True),
+    "accept": (AUTO, (), True),
+    "verify": (AUTO, ("--verify",), True),
+    "serve": (AUTO, (), True),
+    "chat": (AUTO, (), True),
+    "prune": (AUTO, ("--prune",), True),
+    "eval": (EVAL, (), True),
+    "curves": ("hierophant_search.py", (), True),
+    "publish": ("hierophant_publish.py", (), False),
+    "data fetch": ("fetch_datasets.py", (), False),
+    "data models": ("fetch_models.py", (), False),
+    "data filter": ("filter_prompts.py", (), False),
+    "data translate": ("translate_prompts.py", (), False),
+}
+CHOSEN = {"--search", "--recipe", "--indices"}  # build flags that override an accepted recipe
+
+
+def fail(message):
+    sys.exit(f"{message}\n{USAGE}".strip())
+
+
+def is_flag(arg):
+    return arg.startswith("-")
+
+
+def take_flag(args, flag):
+    """(flag's value, args without it), for a flag that only completes MODEL: no tool sees it."""
+    if flag not in args:
+        return "", args
+    i = args.index(flag)
+    if i + 1 == len(args):
+        fail(f"{flag} needs a value")
+    return args[i + 1], args[:i] + args[i + 2:]
+
+
+def follow_flags(name, config, quant, args):
+    """the flags that make build follow the accepted recipe, unless told otherwise."""
+    recipe = recipe_args(config, quant) if name in ("build", "verify") else []
+    if name == "verify" and not recipe:
+        raise ConfigError("verify needs a config with an accepted recipe")
+    return [] if CHOSEN & set(args) else recipe
+
+
+def model_args(args, name):
+    """args with MODEL named as the tools name it, after the flags the configs set, so that
+    the command line has the last word."""
+    quant, args = take_flag(args, "--quant")
+    base, config = [], None
+    if args and not is_flag(args[0]):
+        base, config = resolve(args[0], quant, load_configs())
+        args = args[1:]
+    tag = base[1].partition(":")[2] if base[:1] == ["--hf-repo"] else ""
+    return [*machine_flags(load_machine()), *(search_flags(config) if COMMANDS[name][0] == AUTO else []),
+            *follow_flags(name, config, tag, args), *base, *(x for x in args if x != "--search")]
+
+
+def accept_args(args):
+    """accept MODEL [RECIPE]: the recipe goes straight after the flag that takes it."""
+    recipe = args[1:2] if len(args) > 1 and not is_flag(args[1]) else []
+    return ["--accept", *recipe, *model_args([*args[:1], *args[1 + len(recipe):]], "accept")]
+
+
+def program_args(args, name):
+    """serve or chat MODEL [-- ARGS]: what follows -- is the llama.cpp program's."""
+    i = args.index("--") if "--" in args else len(args)
+    return [*model_args(args[:i], name), f"--{name}", *args[i + 1:]]
+
+
+def publish_line(args):
+    """publish MODEL, named as for build: a config's accepted adapters, or without a config
+    the best of REPO:QUANT's run. adapter files pass through."""
+    if not args or is_flag(args[0]) or args[0].endswith(".gguf") or Path(args[0]).exists():
+        return args
+    quant, args = take_flag(args, "--quant")
+    name, args = take_flag(args, "--name")
+    model, _, tag = args[0].partition(":")
+    configs = load_configs()
+    stem = config_of_repo(model, configs) if "/" in model else find_config(model, configs)
+    if stem:
+        return [*publish_args(stem, configs[stem], load_machine(), quant or tag, name), *args[1:]]
+    if not quant and not tag:
+        raise ConfigError(f"{model} has no config, so it needs a quant: {model}:QUANT")
+    return [*run_best(model, quant or tag, load_machine()), *args[1:]]
+
+
+def command_line(argv):
+    """the program and arguments that argv stands for."""
+    if argv[0] == "core":
+        return [str(CORE), *argv[1:]]
+    words = 2 if argv[0] == "data" else 1
+    name, rest = " ".join(argv[:words]), argv[words:]
+    if name not in COMMANDS:
+        fail(f"unknown command: {name}")
+    script, flags, takes_model = COMMANDS[name]
+    special = {"accept": accept_args, "publish": publish_line}
+    if name in special:
+        rest = special[name](rest)
+    elif name in ("serve", "chat"):
+        rest = program_args(rest, name)
+    elif takes_model:
+        rest = model_args(rest, name)
+    return [sys.executable, "-I", str(SCRIPTS / script), *flags, *rest]
+
+
+def run(argv):
+    """answer here, or replace this process with the tool."""
+    if argv == ["status"]:
+        print(summary(load_configs()))
+        return
+    if argv[0] == "config":
+        print(" ".join(model_args(argv[1:], "build")))
+        return
+    if argv[0] == "init":
+        if len(argv) != 2 or "/" not in argv[1]:
+            fail("init needs REPO, as org/name")
+        print(init(argv[1]))
+        return
+    cmd = command_line(argv)
+    try:
+        os.execv(cmd[0], cmd)
+    except FileNotFoundError:
+        sys.exit(f"{cmd[0]} is missing: run make")
+
+
+def main(argv):
+    if not argv:
+        fail("no command given")
+    if argv[0] in ("help", "-h", "--help"):
+        print(USAGE, end="")
+        return
+    try:
+        run(argv)
+    except ConfigError as e:
+        sys.exit(str(e))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

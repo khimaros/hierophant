@@ -27,8 +27,10 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 from gguf_lite import Reader
-from hierophant_eval import MAX_KLD, add_model_args, entry, kl_of, load_prompts
-from hierophant_pipeline import (
+from hierophant_config import accept as config_accept
+from hierophant_config import accepted_recipe, load_configs, parse_recipe
+from hierophant_eval import MAX_KLD, add_model_args, entry, has_marker, kl_of, load_prompts
+from hierophant_run import (
     BIN,
     DATA,
     MIN_RESIDUAL,
@@ -69,6 +71,7 @@ THINK_PROMPTS, THINK_BUDGET, THINK_EFFORT = 128, 512, "auto"
 BUDGET_MESSAGE = "\n\ntime to answer.\n"
 BUILT_SUFFIX = ".built"  # beside an adapter's output name: the arguments of its finished build
 SHARED_CACHE = "cache.jsonl"  # every eval request of the run, by what determines its outcome
+GIB = 1 << 30
 # selection ranks by refusals alone, so it leaves out the reply logp, its slowest stage
 # (a request per reply token); the report keeps it for the sidecar of what it promotes
 SELECT_ONLY = ("--logp-tokens", 0)
@@ -153,14 +156,17 @@ def select_beam(ranked, n, size):
     return [ranked[i]["cand"] for i in sorted(picked + near[:size - len(picked)])]
 
 
-def halve(ranked, n, size, seen=()):
+def halve(ranked, n, size, seen=(), last=False):
     """(candidates, beam) after a halving round on n prompts: its better half by rank and
     anything within a standard error of the last of it, which the prompts cannot tell from
     it, each at the weight it was found to reach the budget at. once at most
     RESIDUAL_SURVIVORS are left, each one's residual variant joins them, unless seen before.
-    once the survivors fit in size, no candidates and them as the beam."""
+    before the last round only that many go on: near ties could otherwise keep more than
+    that all the way, and no residual would be measured at all. once the survivors fit in
+    size, no candidates and them as the beam."""
     cut = ranked[math.ceil(len(ranked) / 2) - 1]["refusals"]
     keep = [x["cand"] for x in ranked if x["refusals"] <= cut + stderr(cut, n)]
+    keep = keep[:RESIDUAL_SURVIVORS] if last else keep
     if len(keep) <= size:
         return [], keep
     residuals = [{**c, "residual": True, "wide": True} for c in keep if not c["residual"]]
@@ -172,7 +178,7 @@ def plan(ranked, halving, n, pool, seen, a):
     double, since only more prompts split a tie; then the beam is chosen."""
     if not halving or n >= pool:
         return [], select_beam(ranked, n, a.beam)
-    return halve(ranked, n, a.beam, seen)
+    return halve(ranked, n, a.beam, seen, last=n * 2 >= pool)
 
 
 def beats(lead, best):
@@ -201,8 +207,10 @@ def unchanged_after(unchanged, outcome, n, pool):
 
 def first_state(a, n_layer):
     indices, step = ([float(i) for i in a.indices.split(",")], 1.0) if a.indices else grid(n_layer)
-    return {"round": 0, "step": step, "candidates": crossed(indices, a.first_pcs), "beam": [], "seen": [],
-            "best": None, "unchanged": 0, "halving": True}
+    cands = [{**parse_recipe(a.recipe), "weight": a.recipe_weight, "wide": True}] if a.recipe else \
+        crossed(indices, a.first_pcs)
+    return {"round": 0, "step": step, "candidates": cands, "beam": [], "seen": [], "best": None, "unchanged": 0,
+            "halving": True}
 
 
 def crossed(indices, pcs):
@@ -225,11 +233,19 @@ def next_candidates(st, n_layer, a):
 
 
 class Auto(Run):
-    """a pipeline run that builds, scores and promotes candidates round by round."""
+    """a run that builds, scores and promotes candidates round by round."""
 
     echo = False
     rollup = ("sites",)  # each build's sites advance the round's builds bar
     round_bar = Quiet()  # the round's stage, before every bar drawn in it
+
+    def __init__(self, a):
+        """a named run keeps its own rounds and best in OUT/runs/NAME; what any recipe of
+        this base can reuse (the directions, the cache, the residuals) stays in OUT."""
+        super().__init__(a)
+        self.root, self.out = self.out, run_out(a)
+        self.logs = self.out / "logs"
+        self.logs.mkdir(parents=True, exist_ok=True)
 
     def build(self, d, cands):
         """one adapter per candidate in d, each named after it; those differing only in
@@ -284,7 +300,7 @@ class Auto(Run):
         """the directions of what c without its residual still refuses, captured with it
         applied; None when too few prompts are left. reused across nearby weights."""
         base = {**c, "residual": False}
-        d = self.out / "residual" / key(base)
+        d = self.root / "residual" / key(base)
         done = d / "weight.json"
         if done.exists() and abs(json.loads(done.read_text())["weight"] / c["weight"] - 1) <= RESIDUAL_REUSE:
             return d / "dirs.gguf" if (d / "dirs.gguf").exists() else None
@@ -337,7 +353,7 @@ class Auto(Run):
                 cands = self.screen(d, n_layer)
             self.round_bar.stage("builds")
             cands = self.build(d, cands)
-            ranked = rank(cands, self.select(d, cands, n), self.a.max_kld)
+            ranked = self.settle_residuals(d, rank(cands, self.select(d, cands, n), self.a.max_kld), n)
             print_ranked(ranked)
             best, outcome = self.report(d, ranked[0], st["best"], min(self.a.report_prompts, SELECT_OFFSET), rnd)
         seen = {*st["seen"], *(key(c) for c in cands)}
@@ -377,6 +393,24 @@ class Auto(Run):
         d.mkdir(exist_ok=True)
         self.screen(d, n_layer, known)
 
+    def settle_residuals(self, d, ranked, n):
+        """ranked, after one more try for each residual that landed far from the weight it was
+        captured under: a capture under a much stronger adapter is not the residual that weight
+        would serve, so its first score says little. building it again recaptures it."""
+        moved = [x["cand"] for x in ranked if x["cand"]["residual"] and self.capture_moved(x["cand"])]
+        if not moved:
+            return ranked
+        again = d / f"{d.name}-residuals"
+        again.mkdir(parents=True, exist_ok=True)
+        kept = self.build(again, moved)
+        retried = {key(x["cand"]): x for x in rank(kept, self.select(again, kept, n), self.a.max_kld)}
+        return sorted((retried.get(key(x["cand"]), x) for x in ranked), key=lambda x: (x["refusals"], x["kl"]))
+
+    def capture_moved(self, c):
+        """whether c's weight is too far from the one its residual was captured under to reuse it."""
+        done = self.root / "residual" / key({**c, "residual": False}) / "weight.json"
+        return done.exists() and abs(json.loads(done.read_text())["weight"] / c["weight"] - 1) > RESIDUAL_REUSE
+
     def select(self, d, cands, n):
         """{adapter file name: sweep} on n selection prompts, swept wide where a candidate's
         weight is not known yet and narrow around it where it is."""
@@ -409,7 +443,8 @@ class Auto(Run):
         sweeps = self.score(f"{d.name}-report", loras, n, 0, NARROW_SCALES, REPORT_CHUNKS, rd / "report.json",
                             sidecars=True)
         base = next(p["refusals"] for p in next(iter(sweeps.values())) if p["scale"] == 0)
-        think = self.think_score(d.name, rd, loras, min(n, self.a.think_prompts))
+        scales = {x: at_budget(sweeps[x.name], self.a.max_kld)["scale"] or 1 for x in loras}
+        think = self.think_score(d.name, rd, scales, min(n, self.a.think_prompts))
         if best and not refined:
             best = {**without_think(best), **at_budget(sweeps["incumbent.gguf"], self.a.max_kld), "n": n,
                     "base": base, **think.get("incumbent.gguf", {})}
@@ -423,25 +458,36 @@ class Auto(Run):
         self.promote(rd / f"{key(c)}.gguf")
         return ({**lead, "round": best["round"]} if refined else lead), "refined" if refined else "new"
 
-    def think_score(self, label, rd, loras, n):
+    def think_score(self, label, rd, scales, n):
         """{adapter file name: {think, think_base, think_n}}: refusals with thinking on, each
-        adapter at its own weight (scale 1), on the first n report prompts. the reasoning is
-        kept short, which is not how the model is served; the final check covers that."""
+        adapter of {path: scale} at the scale its report score was measured at, on the first
+        n report prompts. the reasoning is kept short, which is not how the model is served;
+        the final check covers that."""
         if not n:
             return {}
         self.round_bar.stage("think")
         a = self.a
         capped = a.think_budget >= 0
         budget = ["--reasoning-budget", a.think_budget, "--reasoning-budget-message", BUDGET_MESSAGE] if capped else []
-        self.eval(f"{label}-think",
-                    *self.serve(a.think_budget + a.max_tokens if capped else a.think_max_tokens), *loras_of(loras),
-                    "--harmful", confirm_sets(), "--limit", n, "--harmless-offset", 0, "--scales", 1, "--think",
-                    "--reasoning-effort", a.think_effort, *budget, "--think-kwargs", json.dumps(a.think_kwargs),
-                    "--judge", a.judge, "--no-sidecar", "--results", rd / "think.json",
-                    "--server-log", self.logs / f"server-{label}-think.log")
-        sweeps = json.loads((rd / "think.json").read_text())
-        at = {name: {p["scale"]: p["refusals"] for p in s} for name, s in sweeps.items()}
-        return {name: {"think": r[1], "think_base": r[0], "think_n": n} for name, r in at.items()}
+        by_scale, sweeps = {}, {}
+        for lora, scale in scales.items():
+            by_scale.setdefault(scale, []).append(lora)
+        for i, (scale, loras) in enumerate(by_scale.items()):
+            part = rd / f"think-{i}.json"
+            self.eval(f"{label}-think",
+                        *self.serve(a.think_budget + a.max_tokens if capped else a.think_max_tokens), *loras_of(loras),
+                        "--harmful", confirm_sets(), "--limit", n, "--harmless-offset", 0, "--scales", f"{scale:g}",
+                        "--think", "--reasoning-effort", a.think_effort, *budget,
+                        "--think-kwargs", json.dumps(a.think_kwargs), "--judge", a.judge, "--no-sidecar",
+                        "--results", part, "--server-log", self.logs / f"server-{label}-think.log")
+            sweeps |= json.loads(part.read_text())
+            part.unlink()
+        (rd / "think.json").write_text(json.dumps(sweeps, indent=2) + "\n")
+        at = {name: {p["scale"]: p for p in s} for name, s in sweeps.items()}
+        return {Path(lora).name: {"think": at[Path(lora).name][s]["refusals"], "think_n": n,
+                                  "think_base": at[Path(lora).name][0]["refusals"],
+                                  "think_reasoned": reasoned(at[Path(lora).name][s])}
+                for lora, s in scales.items()}
 
     def promote(self, lora):
         """the adapter and its sidecar become best.*, each replaced in one step."""
@@ -453,7 +499,7 @@ class Auto(Run):
     def finish(self, st, outcome):
         b = st["best"]
         verb = {"new": "new best", "refined": "best refined", "kept": "best unchanged"}[outcome]
-        thinking = f" ({b['think']:.3f} with short thinking)" if "think" in b else ""
+        thinking = f" ({b['think']:.3f} with short thinking{no_reasoning(b)})" if "think" in b else ""
         line = f"{b['key']} (round {b['round']})  refusals {b['refusals']:.3f}{thinking}, kl {b['kl']:.4f}"
         print(f">> {verb}: {line}\n   {self.out / 'best.gguf'}", flush=True)
         with open(self.out / "history.txt", "a") as f:
@@ -462,30 +508,53 @@ class Auto(Run):
         tmp = self.out / "state.json.tmp"
         tmp.write_text(json.dumps(st, indent=2) + "\n")
         os.replace(tmp, self.out / "state.json")
+        if not self.a.keep_rounds:
+            remove(dead_files(self.root))
+
+    def compare(self):
+        """--lora adapters beside the best on the report's prompts, each where its kl
+        reaches the budget. it reads the cache; the run itself is left as it was."""
+        d = self.out / "compare"
+        d.mkdir(exist_ok=True)
+        best = self.out / "best.gguf"
+        loras = [*([best] if best.exists() else []), *(Path(x).expanduser() for x in self.a.lora)]
+        sweeps = self.score("compare", loras, min(self.a.report_prompts, SELECT_OFFSET), 0, WIDE_SCALES,
+                            REPORT_CHUNKS, d / "compare.json")
+        print(f"{'adapter':24} {'refusals@kl':>11} {'scale':>7} {'kl':>7}")
+        for lora in loras:
+            at = at_budget(sweeps[lora.name], self.a.max_kld)
+            print(f"{lora.stem:24} {at['refusals']:11.3f} {at['scale']:7.3g} {at['kl']:7.4f}")
 
     def write_best(self, st):
         b, think = st["best"], st.get("think")
-        scale = json.loads((self.out / "best.json").read_text())["scale"]
+        side = json.loads((self.out / "best.json").read_text())
+        scale = side["scale"]
         lines = [f"{b['key']} at weight {b['cand']['weight']:g}, found in round {b['round']}",
                  (f"held-out: refusals {b['refusals']:.3f} (base {b['base']:.3f}) at kl {b['kl']:.4f}, "
                   f"{b['n']} prompts")]
         if "think" in b:
             lines.append(f"held-out, short thinking: refusals {b['think']:.3f} (base {b['think_base']:.3f}), "
-                         f"{b['think_n']} prompts")
-        if think:
-            lines.append(f"thinking on: refusals {think['refusals']:.3f}, unfinished {think['unfinished']:.3f}, "
-                         f"loops {think['loops']:.3f}, {think['n']} prompts")
+                         f"{b['think_n']} prompts{no_reasoning(b)}")
+        if think and "markers" in think:
+            lines.append(f"full replies, thinking on: refusals {think['markers']:.3f} by markers, "
+                         f"{think['refusals']:.3f} by the base as judge, unfinished {think['unfinished']:.3f}, "
+                         f"loops {think['loops']:.3f}, reasoning in {think['reasoned']:.2f}, {think['n']} prompts")
         lora = (self.out / "best.gguf").absolute()
         if not scale:
             lines.append("no scale of it refused less than the base within the kl budget; served at 1 anyway")
-        lines += [f"serve: llama-server {serve_model(self.a)} --lora-scaled {lora}:{scale or 1:g}",
+        lines += [f"built with llama.cpp {side.get('llama_cpp', 'unknown')}",
+                  f"serve: llama-server {serve_model(self.a)} --lora-scaled {lora}:{scale or 1:g}",
                   f"sidecar: {lora.with_suffix('.json')}"]
         (self.out / "best.txt").write_text("\n".join(lines) + "\n")
 
     def final_check(self, st):
-        """the best with thinking on, once per best: replies that never finish show up here."""
+        """the best with thinking on and full-length replies, once per best: replies that
+        never finish or go round in circles show up here, and nowhere else. markers is
+        the measure the report uses, so the two compare; the base as judge also counts
+        warnings and deflection, so it runs well above markers on an adapter's long replies."""
         b = st["best"]
-        if not self.a.think_check or (st.get("think") or {}).get("for") == [b["key"], b["cand"]["weight"]]:
+        done = st.get("think") or {}
+        if not self.a.think_check or (done.get("for") == [b["key"], b["cand"]["weight"]] and "markers" in done):
             return
         print(f"== final check: {b['key']} with thinking on ({self.a.think_limit} prompts)", flush=True)
         d = self.out / "final"
@@ -497,15 +566,19 @@ class Auto(Run):
                     "--scales", f"{scale:g}", "--think", "--judge", "self", "--no-sidecar",
                     "--results", d / "think.json", "--server-log", self.logs / "server-final.log")
         p = next(p for p in json.loads((d / "think.json").read_text())["best.gguf"] if p["scale"] != 0)
-        st["think"] = {"for": [b["key"], b["cand"]["weight"]], "n": self.a.think_limit,
-                       **{k: p[k] for k in ("refusals", "unfinished", "loops")}}
+        scores = {"n": self.a.think_limit, "markers": mean_of(marked(r) for r in p["replies"]), "reasoned": reasoned(p),
+                  **{k: p[k] for k in ("refusals", "unfinished", "loops")}}
+        st["think"] = {"for": [b["key"], b["cand"]["weight"]], **scores}
+        side = json.loads((self.out / "best.json").read_text())
+        side["eval"]["final"] = scores
+        (self.out / "best.json").write_text(json.dumps(side, indent=2) + "\n")
         self.write_best(st)
         (self.out / "state.json").write_text(json.dumps(st, indent=2) + "\n")
 
     def eval(self, label, *args):
         """an eval sharing the run's cache: an adapter file, prompt and setting already scored
         by an earlier round (the base, or an incumbent kept since) is not scored again."""
-        self.script(label, "hierophant_eval.py", "--cache", self.out / SHARED_CACHE, *args)
+        self.script(label, "hierophant_eval.py", "--cache", self.root / SHARED_CACHE, *args)
 
     def load_state(self):
         path = self.out / "state.json"
@@ -554,6 +627,126 @@ def stopped(st, a):
     return bool(a.rounds) and st["round"] >= a.rounds
 
 
+def mean_of(values):
+    values = list(values)
+    return sum(values) / len(values)
+
+
+def reasoned(point):
+    """the share of a sweep point's replies that reasoned at all: a model that never does
+    gives a thinking score that says nothing about thinking."""
+    return mean_of(bool(r["reasoning"]) for r in point["replies"])
+
+
+def marked(reply):
+    """whether a reply refuses by the report's measure, its reasoning standing in if empty."""
+    return has_marker(reply["reply"] or reply["reasoning"])
+
+
+def no_reasoning(best):
+    return ", no reasoning seen" if best.get("think_reasoned", 1) == 0 else ""
+
+
+def run_out(a):
+    """the directory of a's rounds and best: OUT, or OUT/runs/NAME with --name."""
+    out = Path(a.out).expanduser()
+    return out / "runs" / a.run_name if a.run_name else out
+
+
+def states(root):
+    """{directory: state} of every run sharing root."""
+    dirs = [root, *sorted((root / "runs").glob("*"))]
+    return {d: json.loads((d / "state.json").read_text()) for d in dirs if (d / "state.json").exists()}
+
+
+def base_key(name):
+    return name.removesuffix("-res")
+
+
+def dead_files(root):
+    """what no later round will read, in every run sharing root: the adapters of recorded
+    rounds, whose scores outlive them in cache.jsonl and round.json, and the residuals of
+    candidates no run still holds. a pruned residual is captured again if it comes back."""
+    runs = states(root)
+    dead = []
+    for d, st in runs.items():
+        for n in range(1, st["round"] + 1):
+            dead += [f for pattern in ("*.gguf", f"*.gguf{BUILT_SUFFIX}") for f in (d / f"round-{n}").rglob(pattern)]
+    alive = {base_key(key(c)) for st in runs.values() for c in (*st["candidates"], *st["beam"])}
+    alive |= {base_key(st["best"]["key"]) for st in runs.values() if st["best"]}
+    for d in sorted((root / "residual").glob("*")):
+        if (d / "weight.json").exists():
+            dead += [f for f in (d / "under.gguf", d / f"under.gguf{BUILT_SUFFIX}") if f.exists()]
+            if d.name not in alive and (d / "dirs.gguf").exists():
+                dead += [d / "dirs.gguf", d / "weight.json"]
+    return dead
+
+
+def remove(files):
+    for f in files:
+        f.unlink(missing_ok=True)
+
+
+def prune(a):
+    """list what is dead, and delete it with --yes."""
+    root = Path(a.out).expanduser()
+    dead = dead_files(root)
+    size = sum(f.stat().st_size for f in dead)
+    for f in dead:
+        print(f)
+    print(f"{len(dead)} files, {size / GIB:.1f} GiB" + ("" if a.yes else ": rerun with --yes to delete them"))
+    if a.yes:
+        remove(dead)
+
+
+def with_best(a, program):
+    """a llama.cpp program on the base with the best at the scale it reaches the budget at."""
+    out = run_out(a)
+    if not (out / "best.gguf").exists():
+        sys.exit(f"no best.gguf in {out} yet")
+    scale = json.loads((out / "best.json").read_text())["scale"] or 1
+    return [str(program), *serve_model(a).split(), "--lora-scaled", f"{(out / 'best.gguf').absolute()}:{scale:g}",
+            "-ngl", str(a.ngl)]
+
+
+def recipe_sidecar(out, recipe):
+    """(the sidecar of a recipe a report scored, its directory's latest), or of the best."""
+    if not recipe:
+        return out / "best.json"
+    reports = sorted(out.glob(f"round-*/report/{recipe}.json"), key=lambda p: int(p.parts[-3].removeprefix("round-")))
+    if not reports:
+        sys.exit(f"no report scored {recipe} in {out}")
+    return reports[-1]
+
+
+def accept_run(a, st, recipe=""):
+    """write a recipe of the run, the best by default, into its model's config."""
+    repo, _, quant = a.hf_repo.partition(":") if a.hf_repo else ("", "", "")
+    if not quant:
+        sys.exit("accept needs REPO:QUANT: a config is about a hub model and one of its quants")
+    out = run_out(a)
+    best = (st or {}).get("best") or {}
+    side = json.loads(recipe_sidecar(out, "" if recipe == best.get("key") else recipe).read_text())
+    think = best if "think" in best and recipe in ("", best.get("key")) else None
+    path = config_accept(repo, quant, side, think)
+    print(f">> accepted {recipe or best.get('key', 'the best')} for {quant} in {path}", flush=True)
+
+
+def should_accept(a, st, config):
+    """whether a finished build records itself: a recipe's measurements for its quant, or a
+    converged search that fills an empty config. it never replaces an accepted recipe."""
+    if not (a.auto_accept and a.hf_repo and st["best"]):
+        return False
+    return bool(a.recipe) or (st["unchanged"] >= PATIENCE and not accepted_recipe(config, ""))
+
+
+def verify_line(st, accepted):
+    """the rebuild beside what the config records."""
+    b, e = st["best"], accepted.get("eval", {})
+    return (f">> verify {b['key']}: refusals {b['refusals']:.3f} at kl {b['kl']:.4f} on {b['n']} prompts, "
+            f"recorded {e.get('refusals', 0):.3f} on {e.get('n', 0)}")
+
+
 def status(out):
     for name in ("best.txt", "history.txt"):
         path = out / name
@@ -563,9 +756,26 @@ def status(out):
 def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     add_model_args(p)
-    p.add_argument("--out", help="output directory (default lora/<model>, named after -m or --hf-repo)")
+    p.add_argument("--out", help="output directory (default out/<model>, named after -m or --hf-repo)")
+    p.add_argument("--name", dest="run_name", default="",
+                   help="keep this run in OUT/runs/NAME, reusing OUT's directions, cache and residuals")
     p.add_argument("--status", action="store_true", help="print the best so far and each round's, and exit")
     p.add_argument("--rounds", type=int, default=0, help="stop after this many rounds (default: once converged)")
+    p.add_argument("--recipe", default="", help="build this recipe (L33-pcs8-res) instead of searching")
+    p.add_argument("--recipe-weight", type=float, default=1.0, help="the weight --recipe starts from")
+    p.add_argument("--no-accept", dest="auto_accept", action="store_false",
+                   help="leave the model's config as it is when the build ends")
+    p.add_argument("--accept", dest="accept_recipe", nargs="?", const="", metavar="RECIPE",
+                   help="write RECIPE, or the best, into the model's config, and exit")
+    p.add_argument("--compare", action="store_true", help="score each --lora beside the best, and exit")
+    p.add_argument("--lora", action="append", default=[], help="an adapter for --compare; repeatable")
+    p.add_argument("--serve", nargs=argparse.REMAINDER, help="run llama-server with the best; the rest goes to it")
+    p.add_argument("--chat", nargs=argparse.REMAINDER, help="run llama-cli with the best; the rest goes to it")
+    p.add_argument("--prune", action="store_true", help="list the files no round will read again, and exit")
+    p.add_argument("--yes", action="store_true", help="with --prune, delete them")
+    p.add_argument("--keep-rounds", action="store_true", help="keep every finished round's adapters")
+    p.add_argument("--verify", action="store_true",
+                   help="rebuild the recipe from nothing in OUT/runs/verify and print it beside the config's scores")
     p.add_argument("--max-kld", type=float, default=MAX_KLD, help="kl budget: the larger of the first-token kl and the kl over --kld-text")
     p.add_argument("--judge", default="markers",
                    help="markers (heretic's), self (the served base model) or an openai-compatible base url")
@@ -613,7 +823,8 @@ def parse_args(argv):
     g.add_argument("-ngl", "--ngl", type=int, default=-1)
     g.add_argument("-np", "--parallel", type=int, default=4)
     g.add_argument("--server", default=BIN / "llama-server")
-    g.add_argument("--hierophant", default=BIN / "hierophant")
+    g.add_argument("--cli", default=BIN / "llama-cli")
+    g.add_argument("--hierophant", default=BIN / "hierophant-core")
     a = p.parse_args(argv)
     if not a.model and not a.hf_repo:
         p.error("give -m or --hf-repo")
@@ -621,17 +832,49 @@ def parse_args(argv):
     if not set(a.first_pcs) <= set(PCS):
         p.error(f"--first-pcs takes counts from {','.join(map(str, PCS))}")
     a.out = a.out or default_out(a)
-    # what the pipeline's prepare steps read: one capture that every pcs count can use
-    vars(a).update(no_filter=False, positions=1, harmless_pcs=max(PCS), think_capture=False, name="best")
+    if a.recipe:
+        parse_recipe(a.recipe)
+        a.rounds = a.rounds or 1
+    if a.verify:
+        a.out, a.run_name, a.auto_accept = Path(a.out) / "runs" / "verify", "", False
+    # what the prepare steps read: one capture that every pcs count can use
+    vars(a).update(no_filter=False, positions=1, harmless_pcs=max(PCS), think_capture=False)
     return a
+
+
+def finish_build(a, st):
+    """what a finished build leaves in the model's config."""
+    repo = (a.hf_repo or "").partition(":")[0]
+    configs = load_configs()
+    config = next((c for c in configs.values() if c["model"]["repo"] == repo), None)
+    quant = (a.hf_repo or "").partition(":")[2]
+    if a.verify:
+        print(verify_line(st, ((config or {}).get("quant") or {}).get(quant, {})), flush=True)
+    elif should_accept(a, st, config):
+        accept_run(a, st)
+    elif a.auto_accept and config and st["unchanged"] >= PATIENCE and st["best"]:
+        print(f">> the accepted recipe stays {accepted_recipe(config, quant)}: "
+              f"hierophant accept writes {st['best']['key']} over it", flush=True)
 
 
 def main(argv):
     a = parse_args(argv)
     if a.status:
-        return status(Path(a.out).expanduser())
+        return status(run_out(a))
+    if a.serve is not None or a.chat is not None:
+        cmd = [*with_best(a, a.server), "-np", str(a.parallel), *a.serve] if a.chat is None else \
+            [*with_best(a, a.cli), *a.chat]
+        return os.execv(cmd[0], cmd)
+    if a.prune:
+        return prune(a)
+    if a.accept_recipe is not None:
+        path = run_out(a) / "state.json"
+        return accept_run(a, json.loads(path.read_text()) if path.exists() else None, a.accept_recipe)
     r = Auto(a)
     r.echo = a.verbose
+    if a.compare:
+        return r.compare()
+    print(f"== build: following recipe {a.recipe}" if a.recipe else "== build: searching", flush=True)
     r.prepare()
     n_layer = Reader(r.dirs).tensors["harmful_mean"]["ne"][1]
     if a.screen_only:
@@ -645,6 +888,7 @@ def main(argv):
     if st["best"]:
         r.final_check(st)
         print(f"best weights: {r.out / 'best.gguf'}\n" + (r.out / "best.txt").read_text(), end="", flush=True)
+        finish_build(a, st)
 
 
 if __name__ == "__main__":

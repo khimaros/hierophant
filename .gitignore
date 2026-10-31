@@ -2,7 +2,7 @@
 /build-vulkan/
 /models/
 /runs/
-/lora/
+/out/
 # prompt sets are fetched by `make datasets`; only the manifest pinning them is kept
 /data/*
 !/data/manifest.json
