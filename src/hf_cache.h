@@ -14,3 +14,8 @@ struct model_source {
 };
 
 model_source resolve_model(const args & a);
+
+struct llama_model;
+
+// the resolved model loaded with -ngl layers offloaded, for the commands that run it
+llama_model * load_model(const args & a);

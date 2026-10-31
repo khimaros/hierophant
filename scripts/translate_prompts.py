@@ -13,7 +13,6 @@ so train and test splits stay apart in every language.
 import argparse
 import json
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,8 +22,10 @@ from hierophant_eval import (
     REFUSAL_MARKERS,
     Server,
     add_server_args,
+    entry,
     load_prompts,
     progress_map,
+    request_pool,
     resolve_model,
 )
 
@@ -108,7 +109,7 @@ def main(argv):
     manifest = Manifest(args)
     server = Server(args, [args.lora] if args.lora else [])
     try:
-        with ThreadPoolExecutor(args.parallel) as pool:
+        with request_pool(args.parallel) as pool:
             for source in args.sources:
                 for code in args.languages.split(","):
                     path, dropped = translate_set(server, args, pool, source, code)
@@ -118,4 +119,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    entry(main)

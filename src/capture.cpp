@@ -256,13 +256,7 @@ int cmd_capture(int argc, char ** argv) {
     const auto harmless = load_prompts(a.need("--harmless"), limit);
     const auto out_path = a.need("-o");
 
-    llama_backend_init();
-    auto mparams         = llama_model_default_params();
-    mparams.n_gpu_layers = a.i32("-ngl", mparams.n_gpu_layers);
-    llama_model * model  = llama_model_load_from_file(resolve_model(a).path.c_str(), mparams);
-    if (!model) {
-        fatal("failed to load model");
-    }
+    llama_model *       model = load_model(a);
     capture_state       state;
     llama_context *     ctx = open_context(a, model, state);
     const prompt_runner runner{ model, ctx, common_chat_templates_init(model, ""), a.str("--system"), a.has("--think"),

@@ -8,7 +8,6 @@ import unittest
 from common import (
     FOREIGN_LORA,
     HARMLESS,
-    LLAMA_PERPLEXITY,
     LLAMA_SERVER,
     MOE,
     MOE_Q8,
@@ -183,6 +182,27 @@ class Reasoning(unittest.TestCase):
         self.assertTrue(declined["refusal"], "a reply cut off after deciding to refuse refuses")
 
 
+class LongReply(unittest.TestCase):
+    """the request timeout bounds a silence, not a reply: thinking at 4096 tokens on a
+    busy server can take longer than it to finish, while tokens keep coming."""
+
+    def test_a_reply_slower_than_the_timeout_still_arrives(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import hierophant_eval
+        from hierophant_eval import OFF, Server
+
+        url, requests = fake_openai(self.addCleanup, lambda body: {
+            "message": {"content": "sure", "reasoning_content": "the user asks"}, "finish_reason": "length"},
+            pause=0.4)
+        args = SimpleNamespace(url=url, lora=[], system="", think=True, max_tokens=8, url_model="")
+        with mock.patch.object(hierophant_eval, "REQUEST_TIMEOUT", 1):
+            got = Server(args).reply("explain", OFF)
+        self.assertEqual(got, ("sure", False, "the user asks"))
+        self.assertTrue(requests[0]["stream"])
+
+
 class ShortThinking(unittest.TestCase):
     """with --think, reasoning can be kept short: a low effort, unless the model's chat
     template rejects that level, and a token budget after which llama-server forces the answer."""
@@ -249,10 +269,10 @@ class Resume(unittest.TestCase):
         cls.first_cache = (cls.dir / "results.json.cache.jsonl").read_text().splitlines()
 
     @classmethod
-    def eval(cls, *extra, server=LLAMA_SERVER, perplexity=LLAMA_PERPLEXITY):
+    def eval(cls, *extra, server=LLAMA_SERVER):
         cmd = [sys.executable, "-I", str(EVAL), "-m", str(MOE), "--lora", str(cls.adapter), "--limit", "3",
-               "--scales", "0.5,1", "--max-tokens", "8", "-np", "2", "--server", str(server), "--perplexity",
-               str(perplexity), "--kld-text", str(HARMLESS), "--kld-ctx", "128", "--kld-chunks", "2",
+               "--scales", "0.5,1", "--max-tokens", "8", "-np", "2", "--server", str(server),
+               "--kld-text", str(HARMLESS), "--kld-ctx", "128", "--kld-chunks", "2",
                "--results", str(cls.dir / "results.json"), *extra]
         return subprocess.run(list(map(str, cmd)), capture_output=True, text=True, check=False)
 
@@ -261,8 +281,9 @@ class Resume(unittest.TestCase):
 
     def test_a_finished_eval_reruns_without_a_server(self):
         self.assertEqual(self.first.returncode, 0, self.first.stdout + self.first.stderr)
-        p = self.eval(server="/nonexistent/llama-server", perplexity="/nonexistent/llama-perplexity")
+        p = self.eval(server="/nonexistent/llama-server")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertRegex(p.stdout, r"cache: \d+ reused, 0 new")
         self.assertEqual(json.loads((self.dir / "results.json").read_text()), self.results)
 
     def test_an_interrupted_eval_repeats_only_what_is_missing(self):
@@ -278,7 +299,7 @@ class Resume(unittest.TestCase):
                          [(r["scale"], len(r["replies"])) for r in self.results[self.adapter.name]])
 
     def test_another_eval_sharing_the_cache_reuses_its_outcomes(self):
-        offline = {"server": "/nonexistent/llama-server", "perplexity": "/nonexistent/llama-perplexity"}
+        offline = {"server": "/nonexistent/llama-server"}
         own = self.eval(**offline)
         self.assertEqual(own.returncode, 0, own.stdout + own.stderr)
         other = self.dir / "other.json"
@@ -289,7 +310,7 @@ class Resume(unittest.TestCase):
 
     def test_a_changed_judge_rejudges_the_same_replies(self):
         n = len(self.cache().read_text().splitlines())
-        p = self.eval("--judge", "self", perplexity="/nonexistent/llama-perplexity")
+        p = self.eval("--judge", "self")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         # one new verdict per prompt at the base and each scale, and nothing else
         self.assertEqual(len(self.cache().read_text().splitlines()), n + 3 * 3)
@@ -402,7 +423,7 @@ class Rebased(unittest.TestCase):
 
 
 class JudgeAndSequenceKld(unittest.TestCase):
-    """a rank-2 adapter scored by the base model as judge, with llama-perplexity's kl over a text."""
+    """a rank-2 adapter scored by the base model as judge, with the kl over a text."""
 
     @classmethod
     def setUpClass(cls):
@@ -412,7 +433,7 @@ class JudgeAndSequenceKld(unittest.TestCase):
         run("adapter", "-m", MOE, "-d", dirs, "-o", cls.adapter, "--direction-index", "3+1")
         cmd = [sys.executable, "-I", str(EVAL), "-m", str(MOE), "--lora", str(cls.adapter), "--limit", "3",
                "--scales", "1", "--max-tokens", "8", "-np", "2", "--server", str(LLAMA_SERVER),
-               "--perplexity", str(LLAMA_PERPLEXITY), "--judge", "self", "--kld-text", str(HARMLESS),
+               "--judge", "self", "--kld-text", str(HARMLESS),
                "--kld-ctx", "128", "--kld-chunks", "2", "--max-kld", "0.5", "--results", str(cls.dir / "results.json"),
                "--progress"]
         cls.proc = raw(cmd)
@@ -448,14 +469,120 @@ class JudgeAndSequenceKld(unittest.TestCase):
 
     def test_progress_draws_a_bar_per_request_and_per_kl_chunk(self):
         full = "#" * 24
+        # one process measures every kl run: the base and the one scale, chunk by chunk
         for line in (f"base replies [{full}] 3/3 100%", f"r2.gguf scale 1 verdicts [{full}] 3/3 100%",
-                     f"kl base logits [{full}] 2/2 100%", f"r2.gguf scale 1 kl [{full}] 2/2 100%"):
+                     f"kl [{full}] 4/4 100%"):
             self.assertIn(line, self.proc.stderr)
         self.assertIn("\r", self.proc.stderr)
-        # the whole sweep (the base, one scale, its kl) prefixes each bar and ends on a line of its own
-        self.assertRegex(self.proc.stderr, r"sweep \d/3 [\d:]+ \| r2\.gguf scale 1 verdicts \[")
-        self.assertIn(f"sweep [{full}] 3/3 100%", self.proc.stderr)
+        # one bar for the whole sweep (the base's 5 stages, the scale's 4 and the kl), naming what
+        # runs; the stages' own bars end on lines above it, never drawn over it
+        self.assertRegex(self.proc.stderr, r"sweep \[[#-]{24}\] \d+/10 [\d.]+% .*\| r2\.gguf scale 1 verdicts")
+        self.assertIn(f"sweep [{full}] 10/10 100.0%", self.proc.stderr)
+        self.assertNotRegex(self.proc.stderr, r"replies \[-{24}\] 0/3")
         self.assertNotIn("base replies: ", self.proc.stdout)
+
+
+class Modes(unittest.TestCase):
+    """the cheaper sweeps the automated search asks for: without reply logp, replies only
+    where the kl reaches the budget, and no replies at all."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tmpdir(cls.addClassCleanup)
+        dirs = capture(MOE, cls.dir / "dirs.gguf")
+        cls.adapter = cls.dir / "a.gguf"
+        run("adapter", "-m", MOE, "-d", dirs, "-o", cls.adapter, "--direction-index", 3)
+
+    def eval(self, name, *extra):
+        results = self.dir / f"{name}.json"
+        cmd = [sys.executable, "-I", str(EVAL), "-m", str(MOE), "--lora", str(self.adapter), "--limit", "3",
+               "--max-tokens", "8", "-np", "2", "--server", str(LLAMA_SERVER), "--kld-text", str(HARMLESS),
+               "--kld-ctx", "128", "--kld-chunks", "2", "--no-sidecar", "--results", str(results), *extra]
+        p = raw(cmd)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p, json.loads(results.read_text())[self.adapter.name]
+
+    def test_logp_tokens_zero_skips_the_reply_logp(self):
+        p, points = self.eval("nologp", "--scales", "1", "--logp-tokens", "0")
+        self.assertNotIn("reply prefixes", p.stdout)
+        self.assertNotIn("reply logp", p.stdout)
+        self.assertTrue(all("reply_logp" not in r and "refusals" in r for r in points))
+
+    def test_at_budget_replies_only_where_the_kl_reaches_it(self):
+        from hierophant_eval import budget_scale
+
+        p, points = self.eval("budget", "--scales", "0.5,1,2", "--at-budget", "--max-kld", "0.05")
+        swept = [r for r in points if r["scale"] in (0.5, 1, 2)]
+        self.assertEqual(len(swept), 3)
+        self.assertTrue(all("kld" in r and "kld_seq" in r for r in swept))
+        replied = [r["scale"] for r in points if "refusals" in r]
+        at = budget_scale(swept + [r for r in points if r["scale"] == 0], 0.05)
+        self.assertEqual(replied, [0, at])
+        self.assertTrue(0 < at < 2, points)
+        # measured there too, not interpolated
+        point = next(r for r in points if r["scale"] == at)
+        self.assertIn("kld_seq", point)
+        self.assertEqual(p.stdout.count(" replies: 3/3"), 2)
+
+    def test_no_replies_keeps_the_first_token_scores(self):
+        p, points = self.eval("noreplies", "--scales", "1", "--no-replies", "--logp-tokens", "1")
+        self.assertNotIn("replies: ", p.stdout)
+        self.assertTrue(all("refusals" not in r and "reply_logp" in r and "kld" in r for r in points))
+
+
+class TextKlds(unittest.TestCase):
+    """hierophant kl's log (llama.cpp's own, on stderr) can run to megabytes; reading it must
+    keep pace, or the child blocks writing it and both wait for ever."""
+
+    def test_a_long_log_is_read_as_it_comes(self):
+        import time
+        from types import SimpleNamespace
+
+        from hierophant_eval import text_klds
+
+        d = tmpdir(self.addCleanup)
+        fake = d / "hierophant"
+        fake.write_text("#!/bin/sh\n"
+                        "yes 'llama_model_loader: - kv  12: some.key str = some value' | head -c 4000000 >&2\n"
+                        "printf 'kl [------------------------] 0/2 0%%\\r' >&2\n"
+                        "printf 'kl [########################] 2/2 100%%\\n' >&2\n"
+                        "echo '{\"lora\": \"a.gguf\", \"scale\": 1, \"kld\": 0.5, \"same_top\": 0.75}'\n")
+        fake.chmod(0o755)
+        args = SimpleNamespace(hierophant=fake, model="m.gguf", kld_text="t.txt", kld_ctx=128, kld_chunks=2, ngl=0,
+                               progress=True)
+        start = time.monotonic()
+        self.assertEqual(text_klds(args, [("a.gguf", 1)]), [[0.5, 0.75]])
+        self.assertLess(time.monotonic() - start, 20)
+
+
+def kl_point(scale, kld, kld_seq=None, **extra):
+    return {"scale": scale, "kld": kld, **({} if kld_seq is None else {"kld_seq": kld_seq}), **extra}
+
+
+class BudgetScale(unittest.TestCase):
+    """where an adapter's kl reaches the budget, found before any reply is generated."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from hierophant_eval import budget_scale
+
+        cls.at = staticmethod(budget_scale)
+
+    def test_interpolated_where_it_crosses(self):
+        self.assertAlmostEqual(self.at([kl_point(0, 0), kl_point(1, 0.05), kl_point(2, 0.15)], 0.1), 1.5)
+
+    def test_the_larger_of_the_two_kls_decides(self):
+        self.assertAlmostEqual(self.at([kl_point(0, 0, 0), kl_point(1, 0.2, 0.05)], 0.1), 0.5)
+
+    def test_within_the_budget_everywhere_takes_the_largest_scale(self):
+        self.assertEqual(self.at([kl_point(0, 0), kl_point(1, 0.01), kl_point(2, 0.02)], 0.1), 2)
+
+    def test_the_first_crossing_counts(self):
+        self.assertAlmostEqual(self.at([kl_point(0, 0), kl_point(1, 0.2), kl_point(2, 0.05)], 0.1), 0.5)
+
+    def test_it_is_rounded_so_a_rerun_asks_for_the_same_scale(self):
+        self.assertEqual(self.at([kl_point(0, 0), kl_point(1, 0.3)], 0.1), 0.33)
 
 
 class Loops(unittest.TestCase):

@@ -7,6 +7,7 @@
 
 int cmd_capture(int argc, char ** argv);
 int cmd_adapter(int argc, char ** argv);
+int cmd_kl(int argc, char ** argv);
 
 static const char * USAGE = R"(usage: hierophant <command> [options]
 
@@ -29,6 +30,11 @@ commands:
            both directions (rank 2); NAME is a group (attn, mlp, embd) or a
            tensor kind; --split writes one weight-1 adapter per group (or
            kind) and layer for the search
+  kl       MODEL --text FILE --lora ADAPTER --scale S [--lora ADAPTER --scale S]...
+           [-c N] [--chunks N] [-ngl N] [-t N]
+           llama-perplexity's kl divergence from the base over every position
+           of the text, for each adapter at its scale, from one model load;
+           one json line per run on stdout
   resolve  MODEL
            print the local path MODEL refers to
   version  print the llama.cpp commit this build links
@@ -82,6 +88,9 @@ int main(int argc, char ** argv) {
     }
     if (cmd == "adapter") {
         return cmd_adapter(argc - 2, argv + 2);
+    }
+    if (cmd == "kl") {
+        return cmd_kl(argc - 2, argv + 2);
     }
     if (cmd == "resolve") {
         return cmd_resolve(argc - 2, argv + 2);

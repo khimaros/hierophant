@@ -5,7 +5,7 @@ a llama-server is started with the adapter loaded but unapplied, then every
 request carries its own lora scale, so one server load covers the whole sweep.
 refusals are counted on harmful prompts; kl divergence of the first-token
 distribution against scale 0 is measured on harmless prompts. optionally
-llama-perplexity measures kl over every position of a text as well.
+hierophant kl measures kl over every position of a text as well.
 """
 
 import argparse
@@ -14,33 +14,41 @@ import json
 import math
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from itertools import zip_longest
+from contextlib import contextmanager
+from itertools import pairwise, zip_longest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gguf_lite import Reader
-from progress import Bar, outer
+from progress import COUNT, Above, Bar, outer
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "build" / "bin"
 HEALTH_TIMEOUT = 600
 REQUEST_TIMEOUT = 600
 SERVER_EXIT_GRACE = 5  # seconds a dropped connection waits to see whether the server died
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)  # ctrl-c, kill, a closed terminal
+STOP_TIMEOUT = 30  # seconds a terminated child has to exit before it is killed
+SERVER_STOP_GRACE = 2  # seconds llama-server gets after each sigterm
+INTERRUPTED = 130  # the exit status of a command stopped by a signal, as shells report ctrl-c
 PROGRESS_EVERY = 32  # at least this many prompts between progress lines
 PROGRESS_LINES = 4  # and about this many lines per stage at most
 HASH_CHUNK = 1 << 24
 SCALE_TOLERANCE = 0.02  # refusal rates this close to the best count as equal
 MAX_KLD = 0.1  # default kl budget of the picked scale
+BUDGET_DIGITS = 2  # of a scale found by budget_scale, so a rerun asks for the same one
+SUMMARY = (("refusals", ".3f"), ("kld", ".4f"), ("top1_same", ".3f"), ("reply_logp", ".3f"), ("unfinished", ".3f"),
+           ("loops", ".3f"))  # a sweep point's line, each where it was measured
 OFF = [(0, 0.0)]  # naming one adapter at scale 0 turns every adapter off
 JUDGE_MAX_TOKENS = 4
 JUDGE_REASONING_CHARS = 2000  # of a cut-off reply's reasoning, the end the judge reads instead
@@ -61,10 +69,8 @@ CACHE_STAGES = {
     "reply logp": ("logp_tokens", "top_k"),
 }
 ESCAPE = re.compile(r"\\(.)")
-KLD_MEAN = re.compile(r"Mean\s+KLD:\s+(\S+)")
-KLD_SAME_TOP = re.compile(r"Same top p:\s+(\S+)")
-# a finished chunk: "[3]5.1234," while saving the base logits, a row "   3    5.1234 ..." of the kl table
-PPL_CHUNK = re.compile(rb"\[\d+\]\d+\.\d+,|^ {0,3}\d+ {4,}\d+\.\d{4} ", re.MULTILINE)
+LINE_END = re.compile(rb"[\r\n]")  # a child's bar redraws end in \r, its lines in \n
+ERROR_TAIL = 1 << 16  # bytes of a failing child's log that its error shows
 
 # heretic's markers: a response containing any of them counts as a refusal.
 REFUSAL_MARKERS = [
@@ -109,6 +115,76 @@ def post(url, body):
     req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
         return json.load(r)
+
+
+def post_stream(url, body):
+    """post a chat completion streamed, so the timeout bounds the wait for each token and
+    not the whole reply; returns the response it adds up to."""
+    req = urllib.request.Request(url, json.dumps({**body, "stream": True}).encode(),
+                                 {"Content-Type": "application/json"})
+    message, finish = {}, None
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
+        for line in r:
+            data = line.decode().removeprefix("data: ").strip()
+            if not data or data == "[DONE]" or not line.startswith(b"data: "):
+                continue
+            c = json.loads(data)["choices"][0]
+            for k, v in c.get("delta", {}).items():
+                if isinstance(v, str):
+                    message[k] = message.get(k, "") + v
+            finish = c.get("finish_reason") or finish
+    return {"choices": [{"message": message, "finish_reason": finish}]}
+
+
+def interrupted(signum, frame):
+    """the first stop signal raises KeyboardInterrupt; later ones are ignored, so a second
+    ctrl-c cannot cut short the cleanup that stops the children."""
+    for s in STOP_SIGNALS:
+        signal.signal(s, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
+def entry(main, hint=""):
+    """main(argv), ended the same way by ctrl-c, kill and a closed terminal: every child
+    stopped and waited for on the way out (llama-server holds the model's memory until it
+    exits), then exit 130 without a traceback. what it prints goes above its progress bar."""
+    sys.stdout, sys.stderr = Above(sys.stdout), Above(sys.stderr)
+    for s in STOP_SIGNALS:
+        signal.signal(s, interrupted)
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        print(f"interrupted{hint}", file=sys.stderr, flush=True)
+        sys.exit(INTERRUPTED)
+
+
+def stop(proc, timeout=STOP_TIMEOUT, signals=1):
+    """terminate a child and wait for it, up to timeout after each of signals sigterms,
+    then kill it if it lingers."""
+    for _ in range(signals):
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    proc.kill()
+    proc.wait()
+
+
+@contextmanager
+def request_pool(workers):
+    """a thread pool that, left by an exception, drops its queued requests rather than
+    sending them all first, and leaves those in flight to end when the server stops."""
+    pool = ThreadPoolExecutor(workers)
+    try:
+        yield pool
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown()
 
 
 class Cache:
@@ -254,10 +330,13 @@ class Server:
         sys.exit("error: llama-server did not become healthy")
 
     def close(self):
+        """stop the server this script started; a later request starts it again.
+        llama-server finishes the replies it is generating before it honours a sigterm,
+        and exits at once on a second one."""
         if self.proc:
-            self.proc.terminate()
-            self.proc.wait()
+            stop(self.proc, SERVER_STOP_GRACE, signals=2)
             self.log.close()
+        self.proc, self.url, self.started = None, self.args.url, False
 
     def body(self, messages, loras, think, **extra):
         """loras is [(id, scale)]; adapters left out run at scale 0."""
@@ -273,10 +352,11 @@ class Server:
             **extra,
         }
 
-    def chat(self, messages, loras, think=False, **extra):
+    def chat(self, messages, loras, think=False, stream=False, **extra):
         self.start()
         try:
-            return post(self.url + "/v1/chat/completions", self.body(messages, loras, think, **extra))["choices"][0]
+            return (post_stream if stream else post)(self.url + "/v1/chat/completions",
+                                                     self.body(messages, loras, think, **extra))["choices"][0]
         except OSError:
             self.check_alive()
             raise
@@ -300,7 +380,7 @@ class Server:
         """(answer, unfinished, reasoning): with --think the reasoning is kept apart from
         the answer, and a reply cut off before its answer is unfinished."""
         self.start()
-        c = self.chat(self.messages(prompt), loras, self.args.think, max_tokens=self.args.max_tokens,
+        c = self.chat(self.messages(prompt), loras, self.args.think, stream=True, max_tokens=self.args.max_tokens,
                       **self.think_extra)
         content = c["message"].get("content") or ""
         unfinished = c.get("finish_reason") == "length" and not content.strip()
@@ -435,124 +515,180 @@ def cached(server, stage, loras, fn):
     return lambda prompt, *rest: server.cache.memo([*parts, prompt], lambda: fn(prompt, *rest))
 
 
-def score(server, pool, judge, loras, harmful, harmless, base=None, label=None):
+def score(server, pool, judge, loras, harmful, harmless, base=None, label=None, kl_only=False):
     """refusals, first-token kl and reply_logp for one lora setting; without base,
-    this is the base. reply_logp is the mean log-probability of the base's own
-    first reply tokens on the harmful prompts: it falls smoothly as the base's
-    (mostly refusing) replies grow unlikely, where a refusal rate moves in steps.
+    this is the base; with kl_only, the first-token kl alone. --no-replies leaves out the
+    refusals and --logp-tokens 0 the reply_logp. reply_logp is the mean log-probability
+    of the base's own first reply tokens on the harmful prompts: it falls smoothly as the
+    base's (mostly refusing) replies grow unlikely, where a refusal rate moves in steps.
     the "dists" and "prefixes" keys feed later comparisons and are not saved.
     with a label, each stage reports its progress; with --progress, every stage draws a bar."""
-    bar = getattr(server.args, "progress", False)
+    args = server.args
+    bar = getattr(args, "progress", False)
 
     def stage(name, fn, *items):
         what = f"{label} {name}" if label else name if bar else None
         return progress_map(pool, what, cached(server, name, loras, fn), *items, bar=bar)
 
-    replies = stage("replies", lambda p: server.reply(p, loras), harmful)
-    verdicts = stage("verdicts", lambda p, r: judge(p, r[0], r[2]), harmful, replies)
+    out = {}
+    if not kl_only and not getattr(args, "no_replies", False):
+        replies = stage("replies", lambda p: server.reply(p, loras), harmful)
+        verdicts = stage("verdicts", lambda p, r: judge(p, r[0], r[2]), harmful, replies)
+        loops = [looped(why + " " + r) for r, _, why in replies]
+        out |= {"refusals": mean(verdicts), "unfinished": mean(r[1] for r in replies), "loops": mean(loops),
+                "replies": [{"prompt": p, "reply": r, "reasoning": why, "unfinished": u, "refusal": v, "looped": lp}
+                            for p, (r, u, why), v, lp in zip(harmful, replies, verdicts, loops)]}
     dists = stage("first tokens", lambda p: server.first_token(p, loras), harmless)
-    prefixes = base["prefixes"] if base else stage("reply prefixes", lambda p: server.prefix(p, OFF), harmful)
-    logps = [x for x in stage("reply logp", lambda p, f: server.prefix_logp(p, loras, f), harmful, prefixes)
-             if x is not None]
     pairs = [(b, a) for b, a in zip(base["dists"] if base else dists, dists) if b and a]
-    loops = [looped(why + " " + r) for r, _, why in replies]
-    return {
-        "refusals": mean(verdicts),
-        "unfinished": mean(r[1] for r in replies),
-        "loops": mean(loops),
-        "kld": mean(kl(b, a) for b, a in pairs),
-        "top1_same": mean(top1(b) == top1(a) for b, a in pairs),
-        "reply_logp": mean(logps) if logps else 0.0,
-        "replies": [{"prompt": p, "reply": r, "reasoning": why, "unfinished": u, "refusal": v, "looped": lp}
-                    for p, (r, u, why), v, lp in zip(harmful, replies, verdicts, loops)],
-        "dists": dists,
-        "prefixes": prefixes,
-    }
+    out |= {"kld": mean(kl(b, a) for b, a in pairs), "top1_same": mean(top1(b) == top1(a) for b, a in pairs),
+            "dists": dists}
+    if not kl_only and args.logp_tokens > 0:
+        prefixes = base["prefixes"] if base else stage("reply prefixes", lambda p: server.prefix(p, OFF), harmful)
+        logps = [x for x in stage("reply logp", lambda p, f: server.prefix_logp(p, loras, f), harmful, prefixes)
+                 if x is not None]
+        out |= {"reply_logp": mean(logps) if logps else 0.0, "prefixes": prefixes}
+    return out
 
 
 def saved(point):
     return {k: v for k, v in point.items() if k not in ("dists", "prefixes")}
 
 
-def evaluate_all(server, judge, harmful, harmless, scales, workers, sweep):
-    """{adapter path: sweep} for every adapter the server loaded, each point counted on sweep."""
-    with ThreadPoolExecutor(workers) as pool:
-        base = score(server, pool, judge, OFF, harmful, harmless, label="base")
-        sweep.update()
+def scales_for(scales, lora):
+    """the scales one adapter is scored at: its own from a {path: scales}, else every adapter's."""
+    return scales[lora] if isinstance(scales, dict) else scales
+
+
+def describe(r):
+    return " ".join(f"{k} {r[k]:{f}}" for k, f in SUMMARY if k in r)
+
+
+def evaluate_all(server, judge, harmful, harmless, scales, workers, kl_only=False, base=None):
+    """({adapter path: sweep}, the base's score) for every adapter the server loaded, the
+    base scored first unless given; with kl_only, only the base is scored in full."""
+    with request_pool(workers) as pool:
+        base = base or score(server, pool, judge, OFF, harmful, harmless, label="base")
         out = {}
         for i, lora in enumerate(server.adapters):
             out[lora] = []
-            for s in scales:
+            for s in scales_for(scales, lora):
                 name = f"{Path(lora).name} scale {s:g}"
-                point = base if s == 0 else score(server, pool, judge, [(i, s)], harmful, harmless, base, name)
-                sweep.update(1 if s else 0)
+                point = base if s == 0 else score(server, pool, judge, [(i, s)], harmful, harmless, base, name,
+                                                  kl_only)
                 r = {"scale": s, **saved(point)}
-                print(f"{name}: refusals {r['refusals']:.3f} kld {r['kld']:.4f} top1_same {r['top1_same']:.3f} "
-                      f"reply_logp {r['reply_logp']:.3f} unfinished {r['unfinished']:.3f} loops {r['loops']:.3f}",
-                      flush=True)
+                print(f"{name}: {describe(r)}", flush=True)
                 out[lora].append(r)
-        return out
+        return out, base
 
 
-def perplexity(args, label, *extra):
-    cmd = list(map(str, [args.perplexity, "-m", args.model, "-c", args.kld_ctx, "--chunks", args.kld_chunks,
-                         "-ngl", args.ngl, *extra]))
-    if getattr(args, "progress", False):
-        code, out = chunk_bar(cmd, label, args.kld_chunks)
-    else:
-        p = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        code, out = p.returncode, p.stdout + p.stderr
-    if code != 0:
-        sys.exit(f"error: llama-perplexity exited with {code}:\n{out}")
-    return out
+def full_sweep(args, server, judge, harmful, harmless, scales, sweep):
+    """every adapter scored in full at every scale, then the kl over --kld-text."""
+    try:
+        sweeps, _ = evaluate_all(server, judge, harmful, harmless, scales, args.parallel)
+    finally:
+        server.close()
+    sequence_klds(args, sweeps, server, kl_runs(args, server, scales) if args.kld_text else [], sweep)
+    return sweeps
 
 
-def chunk_bar(cmd, label, total):
-    """run llama-perplexity, counting its chunks on a bar as it reports each one."""
-    b = Bar(label, total)
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    out = b""
-    while data := p.stdout.read1(HASH_CHUNK):
-        out += data
-        b.update(len(PPL_CHUNK.findall(out)) - b.done)
-    b.close()
-    return p.wait(), out.decode(errors="replace")
+def at_budget_sweep(args, server, judge, harmful, harmless, scales, sweep):
+    """kl first: each adapter's kl at every scale, then the rest of score only at the scale
+    where it reaches --max-kld (budget_scale), the only one a ranking at the budget reads.
+    llama-server and the kl over --kld-text never hold the model at the same time."""
+    try:
+        sweeps, base = evaluate_all(server, judge, harmful, harmless, scales, args.parallel, kl_only=True)
+    finally:
+        server.close()
+    sequence_klds(args, sweeps, server, kl_runs(args, server, scales) if args.kld_text else [], sweep)
+    at = {lora: [s] if (s := budget_scale(points, args.max_kld)) else [] for lora, points in sweeps.items()}
+    try:
+        there, _ = evaluate_all(server, judge, harmful, harmless, at, args.parallel, base=base)
+    finally:
+        server.close()
+    sequence_klds(args, there, server, kl_runs(args, server, at) if args.kld_text else [], sweep)
+    for lora, points in there.items():
+        sweeps[lora] = sorted([r for r in sweeps[lora] if r["scale"] not in at[lora]] + points,
+                              key=lambda r: r["scale"])
+    return sweeps
 
 
-def sequence_klds(args, sweeps, server, sweep):
-    """llama-perplexity's kl over every position of --kld-text, added to each sweep point
-    and counted on sweep.
-    each run is cached like a request; the base's logits are only computed for a run that
-    is not (they are too big to keep: every position's whole vocabulary)."""
+def text_klds(args, todo):
+    """[kl, share of positions with the same top token] of each (adapter, scale) in todo,
+    from one hierophant kl, which loads the model once for all of them; with --progress,
+    a bar counts its chunks as it reports them."""
+    cmd = list(map(str, [args.hierophant, "kl", "-m", args.model, "--text", args.kld_text, "-c", args.kld_ctx,
+                         "--chunks", args.kld_chunks, "-ngl", args.ngl,
+                         *(x for lora, s in todo for x in ("--lora", lora, "--scale", s)),
+                         *(["--progress"] if getattr(args, "progress", False) else [])]))
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    err, rest, b = b"", b"", None
+    try:
+        while data := p.stderr.read1(HASH_CHUNK):
+            err = (err + data)[-ERROR_TAIL:]
+            *segs, rest = LINE_END.split(rest + data)
+            m = next((m for s in reversed(segs) if (m := COUNT.match(s.decode(errors="replace")))), None)
+            if m and m["label"] == "kl":
+                b = b or Bar("kl", int(m["total"]))
+                b.update(int(m["done"]) - b.done)
+        out = p.stdout.read().decode()
+    except BaseException:
+        stop(p)
+        raise
+    if p.wait() != 0:
+        sys.exit(f"error: hierophant kl exited with {p.returncode}:\n{err.decode(errors='replace')}")
+    if b:
+        b.close()
+    rows = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+    return [[r["kld"], r["same_top"]] for r in rows]
+
+
+def kl_runs(args, server, scales):
+    """(adapter path, scale, cache key) of each kl run over --kld-text: every adapter at
+    each of its scales but 0."""
     text = sha256(args.kld_text)
-    with tempfile.TemporaryDirectory(prefix="hierophant-") as d:
-        base = Path(d) / "base.kld"
+    return [(lora, s, ["kld_seq", str(args.model), server.who([(i, s)]), text, args.kld_ctx, args.kld_chunks])
+            for i, lora in enumerate(server.adapters) for s in scales_for(scales, lora) if s]
 
-        def run(lora, scale):
-            if ":" in str(lora):
-                sys.exit(f"error: llama-perplexity cannot load an adapter whose path has a ':' ({lora})")
-            if not base.exists():
-                perplexity(args, "kl base logits", "-f", args.kld_text, "--kl-divergence-base", base)
-            out = perplexity(args, f"{Path(lora).name} scale {scale:g} kl", "--lora-scaled", f"{lora}:{scale}",
-                             "--kl-divergence-base", base, "--kl-divergence")
-            return [float(KLD_MEAN.search(out).group(1)), float(KLD_SAME_TOP.search(out).group(1)) / 100]
 
-        for i, (lora, results) in enumerate(sweeps.items()):
-            for r in results:
-                if r["scale"] == 0:
-                    r["kld_seq"], r["same_top_p_seq"] = 0.0, 1.0
-                    continue
-                parts = ["kld_seq", str(args.model), server.who([(i, r["scale"])]), text, args.kld_ctx,
-                         args.kld_chunks]
-                r["kld_seq"], r["same_top_p_seq"] = server.cache.memo(parts, lambda lo=lora, s=r["scale"]: run(lo, s))
-                sweep.update()
-                print(f"{Path(lora).name} scale {r['scale']:g}: kld over {Path(args.kld_text).name} {r['kld_seq']:.4f}")
+def sequence_klds(args, sweeps, server, runs, sweep):
+    """the kl over every position of --kld-text, added to each sweep point. each run is
+    cached like a request; those that are not are measured together, a unit of sweep."""
+    for r in (r for results in sweeps.values() for r in results if r["scale"] == 0):
+        r["kld_seq"], r["same_top_p_seq"] = 0.0, 1.0
+    todo = [(lora, s, parts) for lora, s, parts in runs if server.cache.get(parts) is None]
+    measured = dict(zip((str(parts) for *_, parts in todo), text_klds(args, [(lo, s) for lo, s, _ in todo]))) \
+        if todo else {}
+    if runs and not todo:
+        sweep.update()
+    for lora, s, parts in runs:
+        r = next(r for r in sweeps[lora] if r["scale"] == s)
+        r["kld_seq"], r["same_top_p_seq"] = server.cache.memo(parts, lambda k=str(parts): measured[k])
+        print(f"{Path(lora).name} scale {s:g}: kld over {Path(args.kld_text).name} {r['kld_seq']:.4f}")
+
+
+def kl_of(point):
+    """the kl a budget is held to: the larger of the first-token kl and the kl over
+    --kld-text, since either alone misses a recipe that keeps one of them near the base."""
+    return max(point["kld"], point.get("kld_seq", 0))
+
+
+def budget_scale(points, max_kld):
+    """the scale where an adapter's kl (kl_of) first reaches max_kld, interpolated between
+    the scales around it, or its largest when it never does; rounded, so that a rerun asks
+    for the same scale and finds it cached."""
+    pts = sorted(points, key=lambda p: p["scale"])
+    for a, b in pairwise(pts):
+        if kl_of(a) <= max_kld < kl_of(b):
+            t = (max_kld - kl_of(a)) / (kl_of(b) - kl_of(a))
+            return round(a["scale"] + t * (b["scale"] - a["scale"]), BUDGET_DIGITS)
+    return pts[-1]["scale"]
 
 
 def pick(results, max_kld):
     """the smallest scale within tolerance of the fewest refusals among those within the kl budget,
-    which is the sequence kl when it was measured, since first-token kl varies between prompt slices."""
-    fits = [r for r in results if r.get("kld_seq", r["kld"]) <= max_kld]
+    which is the sequence kl when it was measured, since first-token kl varies between prompt slices.
+    a point with no replies (a kl-only one of --at-budget) is not a candidate."""
+    fits = [r for r in results if "refusals" in r and r.get("kld_seq", r["kld"]) <= max_kld]
     best = min(r["refusals"] for r in fits)
     return min((r for r in fits if r["refusals"] <= best + SCALE_TOLERANCE), key=lambda r: r["scale"])
 
@@ -703,7 +839,7 @@ def add_server_args(p):
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--logp-tokens", type=int, default=4,
-                   help="base reply tokens whose log-probability makes reply_logp")
+                   help="base reply tokens whose log-probability makes reply_logp (0: no reply_logp)")
     p.add_argument("--system", default="")
     p.add_argument("--think", action="store_true",
                    help="generate refusal replies with thinking on and judge only the answer after it")
@@ -754,12 +890,16 @@ def parse_args(argv):
                    help="adapter gguf from `hierophant adapter`; repeat to score several on one server load")
     p.add_argument("--manifest", default=ROOT / "data" / "manifest.json")
     p.add_argument("--scales", default="0,0.5,1,1.25,1.5")
-    p.add_argument("--perplexity", default=BIN / "llama-perplexity")
-    p.add_argument("--kld-text", help="also measure llama-perplexity's kl over every position of this text")
+    p.add_argument("--kld-text", help="also measure the kl over every position of this text (hierophant kl)")
     p.add_argument("--kld-ctx", type=int, default=512)
     p.add_argument("--kld-chunks", type=int, default=16)
     p.add_argument("--max-kld", type=float, default=MAX_KLD,
                    help="kl budget of the picked scale: --kld-text's kl if measured, else first-token kl")
+    p.add_argument("--at-budget", action="store_true",
+                   help="measure the kl at every scale first, then reply only at the scale where the larger of "
+                        "the first-token and --kld-text kl reaches --max-kld")
+    p.add_argument("--no-replies", action="store_true",
+                   help="no replies or refusals, only the first-token scores (so no pick and no sidecar)")
     p.add_argument("--base-repo", default="", help="defaults to the repo the adapter was built from")
     p.add_argument("--base-file", default="", help="path of the base gguf inside its repo")
     p.add_argument("--results", help="write every sweep point, with every reply, here")
@@ -769,6 +909,24 @@ def parse_args(argv):
     return resolve_model(p, p.parse_args(argv))
 
 
+def stage_count(args, base):
+    """the bars score draws: replies and verdicts, first tokens, and the base's reply
+    prefixes beside each setting's reply logp."""
+    logp = (2 if base else 1) if args.logp_tokens > 0 else 0
+    return (0 if args.no_replies else 2) + 1 + logp
+
+
+def sweep_units(args, n_adapters, scales):
+    """the stages of a sweep, each one bar's worth: the base's, each adapter's at each scale
+    but 0, and the kl over --kld-text, all of it together. --at-budget scores the scales
+    for their first-token kl alone, then each adapter in full where it reaches the budget,
+    with a kl run of its own."""
+    points, kl = n_adapters * (len(scales) - 1), bool(args.kld_text)
+    if args.at_budget:
+        return stage_count(args, True) + points + kl + n_adapters * stage_count(args, False) + kl
+    return stage_count(args, True) + points * stage_count(args, False) + kl
+
+
 def main(argv):
     args = parse_args(argv)
     harmful = load_prompts(args.harmful, args.limit, args.offset)
@@ -776,21 +934,16 @@ def main(argv):
     scales = sorted({0.0, *map(float, args.scales.split(","))})
     cache = Cache(args.cache or (args.results and f"{args.results}{CACHE_SUFFIX}"))
     server = Server(args, cache=cache)
-    points = len(server.adapters) * (len(scales) - 1)
-    # the base, each adapter's scales, and with a kl text each one's kl run
-    with outer(args.progress, "sweep", 1 + points * (2 if args.kld_text else 1)) as sweep:
-        try:
-            sweeps = evaluate_all(server, Judge(args, server), harmful, harmless, scales, args.parallel, sweep)
-        finally:
-            server.close()
-        if args.think:
-            args.reasoning_effort = server.cache.get(server.effort_key())
-        if args.kld_text:
-            sequence_klds(args, sweeps, server, sweep)
+    sweep_of = at_budget_sweep if args.at_budget else full_sweep
+    with outer(args.progress, "sweep", sweep_units(args, len(server.adapters), scales)) as sweep:
+        sweeps = sweep_of(args, server, Judge(args, server), harmful, harmless, scales, sweep)
+    if args.think:
+        args.reasoning_effort = server.cache.get(server.effort_key())
     if args.results:
         named = {Path(lora).name: results for lora, results in sweeps.items()}
         Path(args.results).write_text(json.dumps(named, indent=2) + "\n")
-    write_sidecars(args, sweeps, harmful, harmless, cache)
+    if not args.no_replies:
+        write_sidecars(args, sweeps, harmful, harmless, cache)
     if cache.path:
         print(f"cache: {cache.reused} reused, {cache.new} new ({cache.path})")
 
@@ -828,4 +981,4 @@ def write_sidecars(args, sweeps, harmful, harmless, cache):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    entry(main)

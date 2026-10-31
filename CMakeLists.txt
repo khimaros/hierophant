@@ -40,6 +40,7 @@ add_executable(hierophant
     src/sites.cpp
     src/directions.cpp
     src/capture.cpp
+    src/kl.cpp
     src/adapter.cpp)
 target_link_libraries(hierophant PRIVATE llama llama-common ggml)
 target_compile_definitions(hierophant PRIVATE LLAMA_CPP_COMMIT="${LLAMA_CPP_BUILT_COMMIT}")

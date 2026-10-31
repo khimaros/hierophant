@@ -14,12 +14,22 @@ import json
 import math
 import random
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gguf_lite import Reader
-from hierophant_eval import OFF, Judge, Server, add_server_args, load_prompts, resolve_model, saved, score
+from hierophant_eval import (
+    OFF,
+    Judge,
+    Server,
+    add_server_args,
+    entry,
+    load_prompts,
+    request_pool,
+    resolve_model,
+    saved,
+    score,
+)
 
 # groups weighted flat, as one layer-free weight: the embedding.
 FLAT = ("embd", "token_embd")
@@ -279,7 +289,7 @@ def main(argv):
     server = Server(args)
     s = Search(args, server, parts)
     try:
-        with ThreadPoolExecutor(args.parallel) as pool:
+        with request_pool(args.parallel) as pool:
             judge = Judge(args, server)
             base = s.run(pool, judge, prompts)
             if args.rescore:
@@ -293,4 +303,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    entry(main)

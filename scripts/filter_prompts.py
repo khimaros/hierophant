@@ -12,7 +12,6 @@ answered harmless ones, recorded in the manifest beside their sources.
 import argparse
 import json
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -24,8 +23,10 @@ from hierophant_eval import (
     Server,
     add_server_args,
     cached,
+    entry,
     load_prompts,
     progress_map,
+    request_pool,
     resolve_model,
 )
 
@@ -75,7 +76,7 @@ def main(argv):
     server = Server(args, [args.lora] if args.lora else [], cache)
     under = {"lora": Path(args.lora).name, "lora_scale": args.lora_scale} if args.lora else {}
     try:
-        with ThreadPoolExecutor(args.parallel) as pool:
+        with request_pool(args.parallel) as pool:
             judge = Judge(args, server)
             for option, refused, keep in SETS:
                 source = getattr(args, option)
@@ -87,4 +88,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    entry(main)

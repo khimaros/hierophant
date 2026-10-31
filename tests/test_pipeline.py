@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from common import LLAMA_PERPLEXITY, LLAMA_SERVER, ROOT, TIED, Reader, tmpdir
+from common import LLAMA_SERVER, ROOT, TIED, Reader, tmpdir
 
 PIPELINE = ROOT / "scripts" / "hierophant_pipeline.py"
 SLOW_SECONDS = 10
@@ -20,8 +20,7 @@ SCREEN = ["--screen", "--train-limit", "40", "--confirm-limit", "4", "--kld-chun
 def run_pipeline(out, *args):
     cmd = [sys.executable, "-I", str(PIPELINE), "-m", str(TIED), "--out", str(out), "--name", "tiny",
            "--max-tokens", "8", "--think-limit", "2", "--think-max-tokens", "16", "--kld-ctx", "128",
-           "--kld-chunks", "2", "--confirm-max-kld", LOOSE_KLD, "-np", "2", "--server", str(LLAMA_SERVER),
-           "--perplexity", str(LLAMA_PERPLEXITY), *args]
+           "--kld-chunks", "2", "--confirm-max-kld", LOOSE_KLD, "-np", "2", "--server", str(LLAMA_SERVER), *args]
     return subprocess.run(list(map(str, cmd)), capture_output=True, text=True, check=False)
 
 

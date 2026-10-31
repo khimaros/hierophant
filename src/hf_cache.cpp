@@ -38,3 +38,14 @@ static model_source resolve_hf(const args & a) {
 model_source resolve_model(const args & a) {
     return a.has("--hf-repo") ? resolve_hf(a) : model_source{ a.need("-m"), "", "" };
 }
+
+llama_model * load_model(const args & a) {
+    llama_backend_init();
+    auto mparams         = llama_model_default_params();
+    mparams.n_gpu_layers = a.i32("-ngl", mparams.n_gpu_layers);
+    llama_model * model  = llama_model_load_from_file(resolve_model(a).path.c_str(), mparams);
+    if (!model) {
+        fatal("failed to load model");
+    }
+    return model;
+}

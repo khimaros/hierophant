@@ -36,12 +36,12 @@ SCRIPTS = ROOT / "scripts"
 BIN = ROOT / "build" / "bin"
 DATA = ROOT / "data"
 sys.path.insert(0, str(SCRIPTS))
-from hierophant_eval import add_model_args, model_flags, pick
-from progress import CLEAR, COUNT, around, fit
+from hierophant_eval import add_model_args, entry, model_flags, pick, stop
+from progress import CLEAR, COUNT, OPEN, fit
 
 STEPS = ["filter", "capture", "split", "search", "build", "residual", "confirm", "think", "summary"]
 # options that say how to run, not what to make: changing them needs no --from.
-RUNTIME = {"from_step", "ngl", "parallel", "server", "perplexity", "hierophant", "offline", "progress"}
+RUNTIME = {"from_step", "ngl", "parallel", "server", "hierophant", "offline", "progress"}
 # the first step that reads each option; a change to any other reruns everything.
 # split and search do nothing with --screen, so its builds start over at split too.
 AFFECTS = {
@@ -63,6 +63,7 @@ MIN_RESIDUAL = 4  # still-refused prompts below which a residual direction is no
 READ_CHUNK = 1 << 16
 PROGRESS_HELP = "draw each command's progress bars in place: a request, a kl chunk, a captured prompt, a site"
 LINE_END = re.compile(rb"(?<=[\r\n])")
+RESUME_HINT = ": rerun the same command to continue"
 # --screen: a slice of jbb + lat past the 300 a full confirmation uses, a short kl text, a wide sweep.
 SCREEN = {"confirm_limit": 60, "confirm_offset": 300, "confirm_scales": "0.8,1,1.2,1.4,1.6", "kld_chunks": 4,
           "think_limit": 16, "think_max_tokens": 2048}
@@ -85,6 +86,7 @@ class Run:
     echo = True  # stream each command's output to the terminal, not only to its log
     bar = None  # a bar over several commands, drawn instead of a line per command
     rollup = ()  # labels of the children's bars that advance it
+    doing = ""  # what the bar's unit under way is, named in its detail
 
     def __init__(self, args):
         self.a = args
@@ -116,18 +118,12 @@ class Run:
         with open(log, "a") as f:
             f.write("$ " + shlex.join(cmd) + "\n")
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            drawn = False
-            for seg in segments(p.stdout):
-                # a progress bar's redraw is drawn over the last; only finished lines are kept
-                if seg.endswith("\r"):
-                    drawn = self.redraw(seg) or drawn
-                    continue
-                line = seg.replace(CLEAR, "")
-                if self.echo:
-                    print((CLEAR if drawn else "") + line, end="", flush=True)
-                    drawn = False
-                f.write(line)
-                f.flush()
+            try:
+                drawn = self.stream(p, f)
+            except BaseException:
+                # stopped with the run, it would outlive it holding the model's memory
+                stop(p)
+                raise
             if self.bar:
                 self.bar.draw()
             elif drawn:
@@ -135,14 +131,40 @@ class Run:
             if p.wait() != 0:
                 sys.exit(f"error: step {step} failed with {p.returncode}; see {log}")
 
+    def stream(self, p, f):
+        """a child's output to its log f and, with echo, the terminal. returns whether a
+        redraw is left on the terminal."""
+        drawn = False
+        for seg in segments(p.stdout):
+            # a progress bar's redraw is drawn over the last; only finished lines are kept
+            if seg.endswith("\r"):
+                drawn = self.redraw(seg) or drawn
+                continue
+            line = seg.replace(CLEAR, "")
+            if self.echo:
+                print((CLEAR if drawn else "") + line, end="", flush=True)
+                drawn = False
+            f.write(line)
+            f.flush()
+        return drawn
+
     def redraw(self, seg):
-        """a child's bar: folded into the enclosing bar when it is one of the units that bar
-        rolls up, else drawn as it is. returns whether anything was drawn."""
-        if self.bar and (m := COUNT.match(seg)) and m["label"] in self.rollup:
-            self.bar.part(seg)
+        """a child's bar: under a bar over several commands, it moves that bar when it is
+        one of the units the bar rolls up; else under an open outer bar (a round) it is the
+        share of its stage; else it is drawn as it is. returns whether it was drawn."""
+        text = seg.replace(CLEAR, "").rstrip("\r")
+        m = COUNT.match(text)
+        if self.bar:
+            if m:
+                rolled = m["label"] in self.rollup and int(m["total"])
+                self.bar.follow(int(m["done"]) / int(m["total"]) if rolled else 0, f"{self.doing} {m['label']}")
+        elif OPEN:
+            if m:
+                OPEN[-1].follow(float(m["pct"]) / 100, m["detail"] or m["label"])
         elif self.progress:
-            print(fit(around() + seg.replace(CLEAR, "").rstrip("\r")) + CLEAR + "\r", end="", flush=True)
-        return self.progress
+            print(fit(text) + CLEAR + "\r", end="", flush=True)
+            return True
+        return False
 
     @property
     def progress(self):
@@ -301,7 +323,7 @@ def step_confirm(r):
              "--limit", a.confirm_limit, "--offset", a.confirm_offset, "--harmless-offset", 0,
              "--scales", a.confirm_scales,
              "--kld-text", a.kld_text, "--kld-ctx", a.kld_ctx, "--kld-chunks", a.kld_chunks,
-             "--max-kld", a.confirm_max_kld, "--perplexity", a.perplexity,
+             "--max-kld", a.confirm_max_kld,
              "--results", r.out / "confirm.json", "--server-log", r.logs / "server-confirm.log")
 
 
@@ -461,7 +483,6 @@ def parse_args(argv):
     g.add_argument("-ngl", "--ngl", type=int, default=-1)
     g.add_argument("-np", "--parallel", type=int, default=4)
     g.add_argument("--server", default=BIN / "llama-server")
-    g.add_argument("--perplexity", default=BIN / "llama-perplexity")
     g.add_argument("--hierophant", default=BIN / "hierophant")
     if "--screen" in argv:
         p.set_defaults(**SCREEN)
@@ -489,4 +510,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    entry(main, RESUME_HINT)
