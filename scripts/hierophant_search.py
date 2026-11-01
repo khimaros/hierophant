@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gguf_lite import Reader
 from hierophant_eval import (
+    MAX_KLD,
     OFF,
     Judge,
     Server,
@@ -245,7 +246,7 @@ def parse_args(argv):
     p.add_argument("--startup", type=int, default=20, help="random trials before refining around the best")
     p.add_argument("--objective", choices=("refusals", "logp"), default="refusals",
                    help="rank by the refusal rate, or by reply_logp, which moves smoothly and so is less noisy")
-    p.add_argument("--max-kld", type=float, default=0.05, help="kl budget; the best trial stays within it")
+    p.add_argument("--max-kld", type=float, default=MAX_KLD, help="kl budget; the best trial stays within it")
     p.add_argument("--position", default=",".join(map(str, POSITION)),
                    help="range of the peak position, as fractions of the last layer")
     p.add_argument("--max-weight", default=",".join(map(str, MAX_WEIGHT)), help="range of the peak weight")

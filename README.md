@@ -128,7 +128,7 @@ how it decides:
   0.5 to 2. every layer, because neighbouring layers differ: a grid 5
   layers apart missed L33 on Qwen3.8-Flash-Next.
   every candidate is scored by its
-  refusals where its KL reaches the budget (`--max-kld`, default 0.05),
+  refusals where its KL reaches the budget (`--max-kld`, default 0.1),
   and carries the weight that reaches it into the next round. the KL is the
   larger of the first-token KL and the KL over WikiText. the KL is measured
   at every scale first, then at the scale predicted to reach the budget,
@@ -379,7 +379,7 @@ with `-hft`/`--hf-token` or `HF_TOKEN` for gated repos; `--offline` (or
 the eval prints refusal rate and KL divergence at each scale and writes
 `qwen3-4b-abliterated.json` beside the adapter, recording the base SHA-256,
 the recommended scale and the scores. the recommended scale has the fewest
-refusals whose KL stays within `--max-kld` (default 0.05; the `--kld-text`
+refusals whose KL stays within `--max-kld` (default 0.1; the `--kld-text`
 KL when measured, else the first-token KL). repeat `--lora` to score several
 adapters on one server load; an adapter hierophant did not build (a
 published one, as a baseline) is scored the same way but gets no sidecar.
@@ -584,7 +584,7 @@ curves' weights at each layer.
 
 ```
 ./hierophant core adapter -m model.gguf -d dirs.gguf --direction-index 33 --split -o parts/s-{}.gguf
-./hierophant curves model.gguf --split-dir parts --limit 50 --trials 60 --max-kld 0.05 \
+./hierophant curves model.gguf --split-dir parts --limit 50 --trials 60 --max-kld 0.1 \
   --results search.json
 ```
 

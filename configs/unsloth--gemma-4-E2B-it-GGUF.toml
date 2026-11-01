@@ -3,6 +3,9 @@ name = "gemma-4-E2B-it"
 repo = "unsloth/gemma-4-E2B-it-GGUF"
 license = "apache-2.0"
 
+[search]
+max_kld = 0.05 # the budget its recipe was accepted at
+
 [quant.Q8_0]
 file = "gemma-4-E2B-it-Q8_0.gguf"
 sha256 = "605d3c2647d7c58c1e4b5375ccb5702acf94c2611b4c8d4877812f8fdd32d053"

@@ -262,10 +262,13 @@ small r component.
   one direction leaves. `adapter --residual` appends it to each output's
   directions before gram-schmidt, so the rank-2 edit removes both exactly
   and the second column is the part of the residual the first lacks.
-- the KL budget defaults to 0.05. on lfm3 at 0.1, scale 1 had 0.11 refusals
+- the KL budget defaults to 0.1. on lfm3 at 0.1, scale 1 had 0.11 refusals
   against 0.15 at the scale reaching 0.044, on 100 prompts, and a search at
-  0.05 reached 0.080 held out against 0.060 at 0.1: most of the refusals
-  go early, and the rest cost KL quickly. a model's `[search]` can set another.
+  0.05 reached 0.080 held out against 0.060 at 0.1, and gemma-4-E2B reached
+  0.097 at 0.05: on those most of the refusals go early. qwen3.8 is why it
+  is not 0.05: there the best still refused 0.875 at 0.05 on 128 prompts
+  against about 0.10 at 0.1, and a ranking below the point where refusals
+  fall cut the shapes that won above it. a model's `[search]` can set another.
 - the final check runs at full length, which the report's 64 tokens do not.
   markers is the report's own measure; the base as judge is broader, and on
   lfm3 agreed with markers on the base (48 of 50 each) but not the adapter

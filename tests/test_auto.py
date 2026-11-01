@@ -693,8 +693,8 @@ class ResidualRetry(unittest.TestCase):
 
 class Defaults(unittest.TestCase):
     def test_the_kl_budget(self):
-        # lfm3: 0.1 bought 0.04 fewer refusals than 0.05, at twice the kl
-        self.assertEqual(auto.parse_args(["-m", "model.gguf"]).max_kld, 0.05)
+        # qwen3.8 still refused 0.875 at 0.05, against about 0.10 at 0.1
+        self.assertEqual(auto.parse_args(["-m", "model.gguf"]).max_kld, 0.1)
 
 
 class Accepting(unittest.TestCase):
