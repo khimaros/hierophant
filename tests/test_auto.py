@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -73,6 +74,41 @@ class Budget(unittest.TestCase):
                              {"scale": 1, "refusals": 0.0, "kld": 0.2, "kld_seq": 0.05}], 0.1)
         self.assertAlmostEqual(at["refusals"], 0.5)
         self.assertAlmostEqual(at["scale"], 0.5)
+
+    def test_the_base_never_stands_in_for_an_adapter_with_a_point_of_its_own(self):
+        at = auto.at_budget([point(0, 0.95, 0), point(0.6, 0.97, 0.04)], 0.05)
+        self.assertEqual((at["refusals"], at["scale"]), (0.97, 0.6))
+
+    def test_an_adapter_with_no_point_of_its_own_reads_as_the_base(self):
+        at = auto.at_budget([point(0, 0.95, 0), {"scale": 1, "kld": 0.0, "kld_seq": 0.2}], 0.05)
+        self.assertEqual((at["refusals"], at["scale"]), (0.95, 0))
+
+
+class Refining(unittest.TestCase):
+    """a rebuild of the best's own recipe has to earn the place, as a different recipe does."""
+
+    def report(self, reported):
+        run = auto.Auto.__new__(auto.Auto)
+        c = cand(18, weight=0.744)
+        best = {"key": "L18", "cand": cand(18, weight=0.875), "round": 1, "refusals": 0.180, "n": 300}
+        sweep = [point(0, 0.97, 0), point(1, reported, 0.044)]
+        run.a = SimpleNamespace(max_kld=0.05, think_prompts=0)
+        run.build = lambda d, cands: cands
+        run.score = lambda *args, **kw: {"L18.gguf": sweep}
+        run.think_score = lambda *args: {}
+        run.promoted = []
+        run.promote = run.promoted.append
+        with tempfile.TemporaryDirectory() as d:
+            got = run.report(Path(d), {"cand": c}, best, 300, 2)
+        return got, best, run.promoted
+
+    def test_a_worse_rebuild_leaves_the_best_in_place(self):
+        (kept, outcome), best, promoted = self.report(0.267)
+        self.assertEqual((kept, outcome, promoted), (best, "kept", []))
+
+    def test_a_better_rebuild_replaces_it_and_keeps_the_round_it_was_found_in(self):
+        (kept, outcome), _, promoted = self.report(0.150)
+        self.assertEqual((kept["refusals"], kept["round"], outcome, len(promoted)), (0.150, 1, "refined", 1))
 
 
 class Candidates(unittest.TestCase):
@@ -627,6 +663,18 @@ class ResidualRetry(unittest.TestCase):
         got = self.settle((cand(14), 0.09), (cand(16, residual=True, weight=0.741), 0.211))
         self.assertEqual(self.built, ["L16-res"])
         self.assertEqual([(auto.key(x["cand"]), x["refusals"]) for x in got], [("L16-res", 0.08), ("L14", 0.09)])
+
+    def test_a_retry_names_its_round_once_in_its_builds_and_its_log(self):
+        self.captured("L16", 1.03)
+        steps, labels = [], []
+        self.r.a.progress = False
+        self.r.build = lambda d, cands: auto.Auto.build(self.r, d, cands)
+        self.r.select = lambda d, cands, n: auto.Auto.select(self.r, d, cands, n)
+        self.r.residual_dirs = lambda c: "dirs.gguf"
+        self.r.make_adapter = lambda step, *args: steps.append(step)
+        self.r.score = lambda label, *args, **kw: labels.append(label) or {"L16-res.gguf": [point(1, 0.08, 0.05)]}
+        self.settle((cand(16, residual=True, weight=0.741), 0.211))
+        self.assertEqual((set(steps), labels), ({"round-5-residuals"}, ["round-5-residuals"]))
 
     def test_a_residual_near_its_capture_stands(self):
         self.captured("L16", 0.78)

@@ -20,6 +20,7 @@ SEARCH_KEYS = ("beam", "first_pcs", "first_prompts", "indices", "max_candidates"
                "think_budget", "think_effort", "think_prompts")
 # [defaults] keys of the machine's file, and the flag each one sets
 MACHINE_FLAGS = {"ngl": "-ngl", "parallel": "-np", "judge": "--judge", "progress": "--progress"}
+PUBLISH_DEFAULTS = ("user", "upload")  # [defaults] keys only publish reads
 
 
 class ConfigError(Exception):
@@ -81,7 +82,9 @@ def resolve(model, quant, configs):
     repo, _, tag = model.partition(":")
     stem = config_of_repo(repo, configs)
     tag = quant or tag
-    return ["--hf-repo", f"{repo}:{tag}" if tag else repo], configs[stem] if stem else None
+    if stem:
+        return ["--hf-repo", f"{repo}:{quant_of(stem, configs[stem], tag)}"], configs[stem]
+    return ["--hf-repo", f"{repo}:{tag}" if tag else repo], None
 
 
 def flag(name, value):
@@ -91,7 +94,7 @@ def flag(name, value):
 def machine_flags(machine):
     """the flags of the machine's [defaults]."""
     defaults = machine.get("defaults", {})
-    unknown = sorted(set(defaults) - {*MACHINE_FLAGS, "user"})
+    unknown = sorted(set(defaults) - {*MACHINE_FLAGS, *PUBLISH_DEFAULTS})
     if unknown:
         raise ConfigError(f"unknown [defaults] keys: {', '.join(unknown)}")
     out = []
@@ -99,6 +102,14 @@ def machine_flags(machine):
         if k in defaults and defaults[k] is not False:
             out += [name] if defaults[k] is True else flag(name, defaults[k])
     return out
+
+
+def publish_flags(machine):
+    """the flags of the [defaults] only publish reads. upload must be exactly true, since it
+    makes a plain publish public."""
+    defaults = machine.get("defaults", {})
+    user = defaults.get("user")
+    return [*(["--user", user] if user else []), *(["--upload"] if defaults.get("upload") is True else [])]
 
 
 def search_flags(config):
@@ -196,8 +207,7 @@ def publish_args(stem, config, machine, quant="", name=""):
         adapters.append(str(best))
     if not adapters:
         raise ConfigError(f"{stem} has no accepted recipe to publish")
-    user = machine.get("defaults", {}).get("user")
-    return [*adapters, "--license", config["model"]["license"], *(["--user", user] if user else [])]
+    return [*adapters, "--license", config["model"]["license"], *publish_flags(machine)]
 
 
 def run_best(repo, quant, machine):
@@ -205,8 +215,7 @@ def run_best(repo, quant, machine):
     best = run_dir(repo, quant) / "best.gguf"
     if not best.exists():
         raise ConfigError(f"no {best}: run hierophant build {repo}:{quant}")
-    user = machine.get("defaults", {}).get("user")
-    return [str(best), *(["--user", user] if user else [])]
+    return [str(best), *publish_flags(machine)]
 
 
 def new_config(repo):

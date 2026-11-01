@@ -4,7 +4,8 @@
 one repo per model and one adapter per base quant, each named after the quant it was
 built from (an adapter is exact only for that file) and staged beside its sidecar.
 the README is written from every sidecar staged so far, so publishing another quant
-rewrites its table. nothing leaves the machine without --upload.
+rewrites its table. nothing leaves the machine without --upload, which the machine's
+config can pass.
 """
 
 import argparse
@@ -203,7 +204,9 @@ def parse_args(argv):
     who.add_argument("--repo", help="the hub repo, instead of one named after the model")
     p.add_argument("--quant", default="", help="the base quant, when its file name does not say it")
     p.add_argument("--out", help=f"staging directory (default {STAGE}/<repo name>)")
-    p.add_argument("--upload", action="store_true", help="upload the staging directory with hf upload")
+    p.add_argument("--upload", action=argparse.BooleanOptionalAction, default=False,
+                   help="upload the staging directory with hf upload; --no-upload stages only, whatever "
+                        "the machine's config says")
     p.add_argument("--collection", default=COLLECTION,
                    help="the hub collection an upload joins: a title in the repo's namespace, created if "
                         "missing, or a NAMESPACE/SLUG; empty for none")

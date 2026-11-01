@@ -51,6 +51,14 @@ class Resolve(unittest.TestCase):
     def test_a_repo_still_works_and_finds_its_config(self):
         self.assertEqual(config.resolve("org/LFM-GGUF:Q8_0", "", CONFIGS), (["--hf-repo", "org/LFM-GGUF:Q8_0"], LFM))
 
+    def test_a_repo_with_a_config_takes_its_only_quant(self):
+        # bare, llama.cpp picks a quant of its own and the run's directory loses its quant
+        self.assertEqual(config.resolve("org/LFM-GGUF", "", CONFIGS), (["--hf-repo", "org/LFM-GGUF:Q8_0"], LFM))
+
+    def test_a_repo_with_several_quants_needs_one_named(self):
+        with self.assertRaisesRegex(config.ConfigError, "--quant: it knows Q8_0, Q4_K_M"):
+            config.resolve("org/Qwen-GGUF", "", CONFIGS)
+
     def test_a_repo_without_a_config(self):
         self.assertEqual(config.resolve("org/other-GGUF", "Q8_0", CONFIGS), (["--hf-repo", "org/other-GGUF:Q8_0"], None))
 
@@ -71,6 +79,9 @@ class Flags(unittest.TestCase):
     def test_the_machine_sets_its_own_defaults(self):
         got = config.machine_flags({"defaults": {"ngl": 99, "parallel": 32}})
         self.assertEqual(got, ["-ngl", "99", "-np", "32"])
+
+    def test_publish_s_defaults_only_reach_publish(self):
+        self.assertEqual(config.machine_flags({"defaults": {"user": "me", "upload": True}}), [])
 
     def test_an_unknown_machine_default_is_an_error(self):
         with self.assertRaisesRegex(config.ConfigError, "server"):
@@ -233,6 +244,23 @@ class PublishArgs(unittest.TestCase):
         run = self.in_run({"index": 15, "harmless_pcs": 8})
         got = config.publish_args("m", self.config(), {"defaults": {"user": "me"}})
         self.assertEqual(got, [str(run / "best.gguf"), "--license", "mit", "--user", "me"])
+
+    def test_the_machine_can_upload_by_default(self):
+        run = self.in_run({"index": 15, "harmless_pcs": 8})
+        got = config.publish_args("m", self.config(), {"defaults": {"user": "me", "upload": True}})
+        self.assertEqual(got, [str(run / "best.gguf"), "--license", "mit", "--user", "me", "--upload"])
+
+    def test_only_true_uploads(self):
+        # a publish is public: a stray "false" in the file must not read as yes
+        run = self.in_run({"index": 15, "harmless_pcs": 8})
+        for value in (False, "false", "true", 1):
+            got = config.publish_args("m", self.config(), {"defaults": {"upload": value}})
+            self.assertEqual(got, [str(run / "best.gguf"), "--license", "mit"])
+
+    def test_a_run_without_a_config_uploads_alike(self):
+        best = self.in_run({"index": 15, "harmless_pcs": 8}) / "best.gguf"
+        got = config.run_best("org/M-GGUF", "Q8_0", {"defaults": {"user": "me", "upload": True}})
+        self.assertEqual(got, [str(best), "--user", "me", "--upload"])
 
     def test_the_same_recipe_at_another_weight_is_refused(self):
         # lfm3's accepted L14 came from a named run; the default run's best was L14 at 1.122

@@ -1,0 +1,25 @@
+[model]
+name = "gemma-4-E2B-it"
+repo = "unsloth/gemma-4-E2B-it-GGUF"
+license = "apache-2.0"
+
+[quant.Q8_0]
+file = "gemma-4-E2B-it-Q8_0.gguf"
+sha256 = "605d3c2647d7c58c1e4b5375ccb5702acf94c2611b4c8d4877812f8fdd32d053"
+recipe = { index = 17.5, pcs = 0, residual = false }
+weight = 1.176
+scale = 1
+
+[quant.Q8_0.eval]
+refusals = 0.0967
+base = 0.98
+n = 300
+kl_first_token = 0.0496
+kl_text = 0.05
+think = 0.1797
+think_base = 0.9766
+think_n = 128
+loops = 0.0
+full_refusals = 0.38
+full_n = 50
+llama_cpp = "aa588a3463357ee990b314f41dda242869130704"

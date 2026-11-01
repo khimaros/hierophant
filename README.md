@@ -29,7 +29,10 @@ models over HTTPS.
 make datasets
 
 # optimize a LoRA adapter automatically for an HF model
-./hierophant build unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS --progress -ngl 99
+./hierophant build unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS --progress -ngl 99 -np 32
+
+# chat with the abliterated model
+./hierophant chat unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS
 ```
 
 that is the whole flow. it downloads the model if needed, finds the layers
@@ -44,6 +47,45 @@ model's memory is free when the prompt comes back:
 llama-server -hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS -ngl 99 \
   --lora-scaled out/unsloth--Qwen3.8-Flash-Next-GGUF--UD-IQ4_XS/best.gguf:1
 ```
+
+### config
+
+`configs/<org>--<repo>.toml` holds what is known about one model, with a
+table per quant: its recipe, weight, scale and scores. MODEL can be any
+unique part of a config's name, and `--quant` picks a quant where it has
+several:
+
+```
+./hierophant build qwen3.8
+./hierophant status qwen3.8
+./hierophant status
+```
+
+`status` alone lists every config. a `[search]` table sets `build`'s flags
+for that model (`think_effort = "low"`). a config can be shared, so it can
+only set search settings: paths, URLs and programs come from flags or from
+`~/.config/hierophant/config.toml`, which holds what belongs to the machine:
+
+```toml
+[defaults]
+ngl = 99
+parallel = 32
+progress = true
+judge = "markers"
+user = "khimaros"   # who `publish` stages for
+upload = true       # `publish MODEL` uploads as well as stages
+```
+
+a flag on the command line always wins, and `./hierophant config MODEL`
+prints the flags a command gets from these files. `./hierophant init REPO`
+writes a new config.
+
+a build on another machine writes its config there. `make sync HOST=kairos`
+(with `REMOTE=src/hierophant` as the default checkout there) brings configs
+back, then pushes this checkout; the newer copy of a config wins, so review
+it with `git diff configs/`.
+
+### details
 
 the adapter's strength is built in, so its scale is close to 1; `best.txt`
 gives the exact serve line, and "serving" below shows how to load it
@@ -90,8 +132,8 @@ how it decides:
   and carries the weight that reaches it into the next round. the KL is the
   larger of the first-token KL and the KL over WikiText. the KL is measured
   at every scale first, then at the scale predicted to reach the budget,
-  stepping down until it is measured within it, and replies are generated
-  only there, the one point the ranking reads; selection also leaves out the reply logp, which only
+  past the sweep's top if the budget lies beyond it, stepping down until it
+  is measured within it, and replies are generated only there, the one point the ranking reads; selection also leaves out the reply logp, which only
   the report keeps.
 - `--screen-layers` first screens every layer of that range with each
   `--first-pcs` count on the first token alone (how unlikely the base's own
@@ -208,42 +250,6 @@ they do not, so it is rough. the bars inside it end on lines of their own,
 above it, as each round does with its total time. a line wider than the
 terminal is cut to fit.
 
-### configs
-
-`configs/<org>--<repo>.toml` holds what is known about one model, with a
-table per quant: its recipe, weight, scale and scores. MODEL can be any
-unique part of a config's name, and `--quant` picks a quant where it has
-several:
-
-```
-./hierophant build qwen3.8
-./hierophant status qwen3.8
-./hierophant status
-```
-
-`status` alone lists every config. a `[search]` table sets `build`'s flags
-for that model (`think_effort = "low"`). a config can be shared, so it can
-only set search settings: paths, URLs and programs come from flags or from
-`~/.config/hierophant/config.toml`, which holds what belongs to the machine:
-
-```toml
-[defaults]
-ngl = 99
-parallel = 32
-progress = true
-judge = "markers"
-user = "khimaros"   # who `publish` stages for
-```
-
-a flag on the command line always wins, and `./hierophant config MODEL`
-prints the flags a command gets from these files. `./hierophant init REPO`
-writes a new config.
-
-a build on another machine writes its config there. `make sync HOST=kairos`
-(with `REMOTE=src/hierophant` as the default checkout there) brings configs
-back, then pushes this checkout; the newer copy of a config wins, so review
-it with `git diff configs/`.
-
 ### serving
 
 an adapter is a plain llama.cpp LoRA, so llama-server loads it beside the
@@ -319,7 +325,9 @@ as GGUF files name it), and writes its
 base SHA-256, scale, recipe, held-out refusals and KL, and how it was made.
 staging another quant rewrites the table. nothing is uploaded until the same
 command is run with `--upload`, which runs `hf upload` on the directory; it
-needs `hf auth login` first. an upload then joins the repo to the `hierophant`
+needs `hf auth login` first. `upload = true` in the machine's `[defaults]` does
+the same for `publish MODEL`, not for an adapter file, and `--no-upload` stages
+without it. an upload then joins the repo to the `hierophant`
 collection in its namespace, created the first time: `--collection TITLE`
 or `--collection NAMESPACE/SLUG` names another, and `--collection ""` joins
 none. `--license` is the base model's own, `--repo`
@@ -494,8 +502,8 @@ an adapter is only valid on the base whose SHA-256 its sidecar records.
   n_vocab * ctx * 2 bytes per chunk.
 - `--at-budget` measures the KL at every scale first and replies only at
   the scale where the larger of the first-token and text KL reaches
-  `--max-kld`, measured there first and stepped down if it is over;
-  `--no-replies` scores the first token alone. the automated run uses both.
+  `--max-kld`, measured there first, stepped down if it is over and raised
+  past the last scale if that is still within it; `--no-replies` scores the first token alone. the automated run uses both.
 
 `hierophant core kl` also runs on its own:
 

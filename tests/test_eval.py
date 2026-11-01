@@ -347,6 +347,22 @@ class MissingLogprobs(unittest.TestCase):
         self.assertEqual(point["kld"], 0)
         self.assertEqual(point["reply_logp"], -0.5)
 
+    def test_no_prompt_measured_is_over_any_budget(self):
+        # a scale raised towards the budget can leave no first token to compare on a tiny model
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+
+        from hierophant_eval import OFF, Judge, Server, score
+
+        url, _ = fake_openai(self.addCleanup, lambda body: {"message": {"content": ""}, "finish_reason": "length"})
+        args = SimpleNamespace(url=url, lora=[], system="", think=False, top_k=5, max_tokens=8, logp_tokens=0,
+                               judge="markers", judge_model="")
+        server = Server(args)
+        with ThreadPoolExecutor(2) as pool:
+            point = score(server, pool, Judge(args, server), OFF, ["explain"], ["hi"], kl_only=True)
+        self.assertGreater(point["kld"], 1000)
+        self.assertEqual(point["top1_same"], 0)
+
 
 class ServerDeath(unittest.TestCase):
     def test_a_dead_server_is_reported_with_its_log(self):
@@ -641,8 +657,16 @@ class BudgetCorrection(unittest.TestCase):
     def test_rounding_onto_a_scale_measured_over_steps_below_it(self):
         self.assertEqual(self.next([kl_point(0, 0), kl_point(1.5, 0.1001)], 0.1), 1.49)
 
-    def test_an_adapter_within_the_budget_everywhere_needs_nothing_more(self):
-        self.assertIsNone(self.next([kl_point(0, 0), kl_point(1, 0.01), kl_point(2, 0.02)], 0.1))
+    def test_a_top_scale_within_the_budget_is_raised_towards_it(self):
+        # gemma-4-E2B: a weight pulled down on 64 prompts capped its report at 0.0442 of 0.05
+        points = [kl_point(0, 0), kl_point(0.85, 0.024), kl_point(1, 0.033), kl_point(1.15, 0.044)]
+        self.assertEqual(self.next(points, 0.05), 1.23)
+
+    def test_a_raise_is_capped_for_an_adapter_far_within_the_budget(self):
+        self.assertEqual(self.next([kl_point(0, 0), kl_point(1, 0.01), kl_point(2, 0.02)], 0.1), 3)
+
+    def test_a_top_scale_at_the_budget_needs_nothing_more(self):
+        self.assertIsNone(self.next([kl_point(0, 0), kl_point(1.15, 0.04999)], 0.05))
 
     def test_the_answer_is_the_largest_scale_measured_within_before_the_first_crossing(self):
         points = [kl_point(0, 0), kl_point(1, 0.09), kl_point(1.01, 0.099), kl_point(1.02, 0.107), kl_point(2, 0.05)]

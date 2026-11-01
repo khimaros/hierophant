@@ -50,8 +50,9 @@ each command's --help lists its options.
   chat MODEL [-- ARGS]
                     llama-cli with the best at its scale
   publish MODEL     stage every accepted adapter, or one with :QUANT, and
-                    --upload sends them; REPO:QUANT with no config and ADAPTER
-                    files take --license and --user
+                    --upload sends them, or upload = true in the machine's
+                    config, unless --no-upload; REPO:QUANT with no config and
+                    ADAPTER files take --license and --user
   prune MODEL       list what no round will read again; --yes deletes it
   curves MODEL      search weight curves over --split-dir adapters
   config MODEL      the flags build gets from the configs

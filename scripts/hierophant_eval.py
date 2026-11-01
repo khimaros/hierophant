@@ -47,6 +47,8 @@ HASH_CHUNK = 1 << 24
 SCALE_TOLERANCE = 0.02  # refusal rates this close to the best count as equal
 MAX_KLD = 0.05  # default kl budget of the picked scale
 BUDGET_DIGITS = 2  # of a scale found by budget_scale, so a rerun asks for the same one
+BUDGET_RAISE = 1.5  # most a scale within the budget is raised by in one measurement
+UNMEASURED_KL = 1e6  # no prompt had a first token to compare: over any budget, and valid JSON
 BUDGET_TRIES = 3  # kl measurements to bring a predicted scale within the budget
 SUMMARY = (("refusals", ".3f"), ("kld", ".4f"), ("top1_same", ".3f"), ("reply_logp", ".3f"), ("unfinished", ".3f"),
            ("loops", ".3f"))  # a sweep point's line, each where it was measured
@@ -549,8 +551,8 @@ def score(server, pool, judge, loras, harmful, harmless, base=None, label=None, 
                             for p, (r, u, why), v, lp in zip(harmful, replies, verdicts, loops)]}
     dists = stage("first tokens", lambda p: server.first_token(p, loras), harmless)
     pairs = [(b, a) for b, a in zip(base["dists"] if base else dists, dists) if b and a]
-    out |= {"kld": mean(kl(b, a) for b, a in pairs), "top1_same": mean(top1(b) == top1(a) for b, a in pairs),
-            "dists": dists}
+    out |= {"kld": mean(kl(b, a) for b, a in pairs) if pairs else UNMEASURED_KL,
+            "top1_same": mean(top1(b) == top1(a) for b, a in pairs) if pairs else 0, "dists": dists}
     if not kl_only and args.logp_tokens > 0:
         prefixes = base["prefixes"] if base else stage("reply prefixes", lambda p: server.prefix(p, OFF), harmful)
         logps = [x for x in stage("reply logp", lambda p, f: server.prefix_logp(p, loras, f), harmful, prefixes)
@@ -711,15 +713,21 @@ def budget_scale(points, max_kld):
 def next_scale(points, max_kld):
     """the scale to measure the kl at next, or None once budget_scale lands on one measured
     within max_kld or none is left to try. a line between two scales can miss by more than
-    their distance suggests, so a prediction is only believed once it has been measured."""
+    their distance suggests, so a prediction is only believed once it has been measured.
+    the kl grows about as the square of a small edit, which places a scale past the sweep's
+    top when the budget lies beyond it: a sweep around a low weight would stop short of it."""
     at = budget_scale(points, max_kld)
     measured = {p["scale"]: p for p in points}
     if at not in measured:
         return at
-    if kl_of(measured[at]) <= max_kld:
+    kl = kl_of(measured[at])
+    if kl > max_kld:
+        at = round(at - 10**-BUDGET_DIGITS, BUDGET_DIGITS)
+        return at if at > 0 and at not in measured else None
+    if at < max(measured):
         return None
-    at = round(at - 10**-BUDGET_DIGITS, BUDGET_DIGITS)
-    return at if at > 0 and at not in measured else None
+    raised = round(at * (min(math.sqrt(max_kld / kl), BUDGET_RAISE) if kl else BUDGET_RAISE), BUDGET_DIGITS)
+    return raised if raised > at else None
 
 
 def within_budget(points, max_kld):

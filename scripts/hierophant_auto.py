@@ -92,16 +92,16 @@ def at_budget(points, budget, metric="refusals"):
     """{metric, scale, kl} where a sweep's kl (kl_of) reaches the budget, interpolated
     between the scales around it, or its least metric within the budget when nothing
     crosses it. a point without the metric (one --at-budget measured the kl of alone)
-    only placed the budget."""
+    only placed the budget. the base answers only for an adapter with no point of its own."""
     pts = sorted(({"scale": p["scale"], metric: p[metric], "kl": kl_of(p)} for p in points if metric in p),
                  key=lambda p: p["scale"])
-    options = [p for p in pts if p["kl"] <= budget]
+    options = [p for p in pts if p["scale"] and p["kl"] <= budget]
     for a, b in pairwise(pts):
         if a["kl"] <= budget < b["kl"]:
             t = (budget - a["kl"]) / (b["kl"] - a["kl"])
             options.append({"scale": a["scale"] + t * (b["scale"] - a["scale"]),
                             metric: a[metric] + t * (b[metric] - a[metric]), "kl": budget})
-    return min(options, key=lambda p: (p[metric], p["kl"]))
+    return min(options or pts[:1], key=lambda p: (p[metric], p["kl"]))
 
 
 def grid(n_layer):
@@ -247,10 +247,14 @@ class Auto(Run):
         self.logs = self.out / "logs"
         self.logs.mkdir(parents=True, exist_ok=True)
 
+    def step_of(self, d):
+        """a directory of this run as a step's name, which also names its bar and log."""
+        return "-".join(d.relative_to(self.out).parts)
+
     def build(self, d, cands):
         """one adapter per candidate in d, each named after it; those differing only in
         index share one pass over the weights."""
-        label = "-".join(d.relative_to(self.out).parts)
+        label = self.step_of(d)
         groups = {}
         for c in cands:
             if not c["residual"]:
@@ -400,7 +404,7 @@ class Auto(Run):
         moved = [x["cand"] for x in ranked if x["cand"]["residual"] and self.capture_moved(x["cand"])]
         if not moved:
             return ranked
-        again = d / f"{d.name}-residuals"
+        again = d / "residuals"
         again.mkdir(parents=True, exist_ok=True)
         kept = self.build(again, moved)
         retried = {key(x["cand"]): x for x in rank(kept, self.select(again, kept, n), self.a.max_kld)}
@@ -419,15 +423,16 @@ class Auto(Run):
             group = [d / f"{key(c)}.gguf" for c in cands if c.get("wide", False) == wide]
             if group:
                 self.round_bar.stage(f"select{suffix}")
-                sweeps |= self.score(f"{d.name}{suffix}", group, n, SELECT_OFFSET, scales, SELECT_CHUNKS,
+                sweeps |= self.score(f"{self.step_of(d)}{suffix}", group, n, SELECT_OFFSET, scales, SELECT_CHUNKS,
                                      d / f"select{suffix}.json", extra=SELECT_ONLY)
         return sweeps
 
     def report(self, d, leader, best, n, rnd):
         """the leader, rebuilt at the weight that reaches the budget, beside the current best
         on n held-out prompts, thinking off and with short thinking. returns the best from now
-        on and the outcome: "new" when a different recipe takes over, "refined" when the best's
-        own recipe is rebuilt at its new weight, "kept" when the best stays as it was."""
+        on and the outcome: "new" when a different recipe takes over, "refined" when a rebuild
+        of the best's own recipe at its new weight beats it, "kept" when the best stays as it
+        was. a rebuild is compared with the best's own score, on the same prompts."""
         self.round_bar.stage("report builds")
         rd = d / "report"
         rd.mkdir(exist_ok=True)
@@ -453,7 +458,7 @@ class Auto(Run):
         c = mine[0]
         lead = {**at_budget(sweeps[f"{key(c)}.gguf"], self.a.max_kld), "key": key(c), "cand": c, "round": rnd, "n": n,
                 "base": base, **think.get(f"{key(c)}.gguf", {})}
-        if best and not refined and not beats(lead, best):
+        if best and not beats(lead, best):
             return best, "kept"
         self.promote(rd / f"{key(c)}.gguf")
         return ({**lead, "round": best["round"]} if refined else lead), "refined" if refined else "new"

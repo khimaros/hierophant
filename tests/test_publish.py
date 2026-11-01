@@ -85,10 +85,17 @@ class Publish(unittest.TestCase):
         cls.none = publish(cls.adapters["F16"], "--user", "tester", "--license", "mit", "--out", cls.stage, "--upload",
                            "--hf", cls.fake_hf, "--collection", "")
         cls.none_calls = cls.hf_args.read_text().splitlines()
+        cls.hf_args.unlink()
+        cls.held = publish(cls.adapters["F16"], "--user", "tester", "--license", "mit", "--out", cls.stage, "--upload",
+                           "--no-upload", "--hf", cls.fake_hf)
 
     def test_both_succeed(self):
         for p in (self.first, self.second):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_no_upload_on_the_command_line_beats_a_machine_s_upload(self):
+        self.assertEqual(self.held.returncode, 0, self.held.stdout + self.held.stderr)
+        self.assertFalse(self.hf_args.exists())
 
     def test_each_adapter_is_staged_under_its_quant_with_its_sidecar(self):
         for quant, name in NAMES.items():

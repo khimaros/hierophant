@@ -310,7 +310,14 @@ small r component.
   must be measured: a point over the budget left a ranking only the line
   from the base's own refusals, so on qwen3.8 L33 with 8 PCs measured 0.102
   at KL 0.107, ranked 0.163 and was cut from a tie for first. a candidate
-  now only reaches the ranking on a point measured within the budget. the
+  now only reaches the ranking on a point measured within the budget. when
+  the top of a sweep is still within it the scale is raised past the top,
+  at most 1.5 times a try, by the square root of what is left, since the KL
+  grows about as the square of a small edit: on gemma-4-E2B a weight pulled
+  down on 64 prompts capped L18's report at KL 0.0442, 0.267 refusals where
+  its earlier build had 0.180 at 0.0483. the base answers only for an
+  adapter with no point of its own, and a rebuild of the best's recipe
+  replaces it only by beating it. the
   server is stopped for each KL run and
   started again after. `--logp-tokens 0` drops reply_logp (a request per
   token, the slowest stage) and `--no-replies` drops the replies, for a
